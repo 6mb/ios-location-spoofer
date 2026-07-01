@@ -29,6 +29,7 @@ const DATA_FILE = path.join(__dirname, "loc.json");
 
 // 字段名/默认值与 location-spoofer.js 的 DEFAULT_CONFIG 对齐
 const DEFAULT = {
+  enabled: true,          // false = 脚本放行原始响应（恢复真实定位）
   latitude: 37.3349,
   longitude: -122.00902,
   altitude: 530,
@@ -91,6 +92,7 @@ function handler(req, res) {
           return send(res, 400, "application/json", '{"error":"bad coords"}');
         }
         const cur = readLoc();
+        cur.enabled = true; // 保存一个新位置 = 开启伪造
         cur.latitude = la;
         cur.longitude = lo;
         // 海拔/精度：脚本里都会被 Math.trunc 成整数，这里取整存
@@ -102,6 +104,30 @@ function handler(req, res) {
         setInt("altitude", j.altitude);
         setInt("horizontalAccuracy", j.horizontalAccuracy);
         setInt("verticalAccuracy", j.verticalAccuracy);
+        writeLoc(cur);
+        return send(res, 200, "application/json", JSON.stringify(cur));
+      } catch (e) {
+        return send(res, 400, "application/json", '{"error":"bad json"}');
+      }
+    });
+    return;
+  }
+
+  // ---- 一键切换：伪造 / 恢复真实定位 ----
+  if (url.pathname === "/enable" && req.method === "POST") {
+    if (TOKEN && token !== TOKEN) {
+      return send(res, 403, "application/json", '{"error":"bad token"}');
+    }
+    let body = "";
+    req.on("data", function (c) {
+      body += c;
+      if (body.length > 1e4) req.destroy();
+    });
+    req.on("end", function () {
+      try {
+        const j = JSON.parse(body);
+        const cur = readLoc();
+        cur.enabled = j.enabled !== false; // false=恢复真实定位（脚本放行）
         writeLoc(cur);
         return send(res, 200, "application/json", JSON.stringify(cur));
       } catch (e) {
@@ -185,6 +211,7 @@ const PAGE = `<!doctype html>
   .opts label{font-size:13px;color:#444;display:flex;flex-direction:column}
   .opts input{width:88px;padding:8px;font-size:15px;border:1px solid #ccc;border-radius:6px;margin-top:2px}
   #savebtn{padding:11px 20px;font-size:16px;border:0;border-radius:8px;background:#34c759;color:#fff;font-weight:600}
+  #restorebtn{padding:11px 16px;font-size:15px;border:0;border-radius:8px;background:#8e8e93;color:#fff}
   .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);
     background:rgba(0,0,0,.85);color:#fff;padding:10px 16px;border-radius:8px;
     font-size:14px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:9999}
@@ -204,6 +231,7 @@ const PAGE = `<!doctype html>
   <label>水平精度<input id="hacc" type="number" inputmode="numeric"></label>
   <label>垂直精度<input id="vacc" type="number" inputmode="numeric"></label>
   <button id="savebtn">保存定位</button>
+  <button id="restorebtn">恢复真实定位</button>
 </div>
 <div class="toast" id="toast"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -248,15 +276,40 @@ var map, marker;
 var WGS = {lat:0, lng:0};   // 当前“定位点(图钉)”的真值 WGS-84（预览用，未必已保存）
 var datum = "gcj";          // 当前底图坐标系：'gcj'(高德) 或 'wgs'(OSM)
 var saved = true;           // 图钉当前位置是否已保存到设备
+var enabledState = true;    // true=伪造中；false=已恢复真实定位（脚本放行）
 
 function $(id){return document.getElementById(id);}
 function toast(t){var e=$("toast");e.textContent=t;e.classList.add("show");setTimeout(function(){e.classList.remove("show");},1800);}
 function numOrNull(id){var v=$(id).value.trim();return v===""?null:Number(v);}
 
 function info(){
+  if(!enabledState){
+    $("info").innerHTML = "<b style='color:#ff9500'>已恢复真实定位 · 脚本放行不修改</b>　（关开定位后生效）";
+    return;
+  }
   var tag = saved ? "已保存 ✓" : "未保存 · 点“保存定位”生效";
   $("info").innerHTML = "<b style='color:"+(saved?"#34c759":"#ff9500")+"'>"+tag+"</b>　WGS-84 "+
     WGS.lat.toFixed(5)+", "+WGS.lng.toFixed(5)+"　海拔 "+($("alt").value||"?")+"m";
+}
+
+// 切换按钮外观：伪造中(灰按钮“恢复真实定位”) / 已恢复(橙按钮“重新开启伪造”)
+function updateEnabledUI(){
+  var b=$("restorebtn");
+  if(enabledState){ b.textContent="恢复真实定位"; b.style.background="#8e8e93"; }
+  else { b.textContent="● 重新开启伪造"; b.style.background="#ff9500"; }
+  info();
+}
+
+// 一键切换 伪造/恢复真实
+function toggleEnabled(){
+  var want = !enabledState;
+  fetch("/enable?token="+encodeURIComponent(token),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:want})})
+    .then(function(r){
+      if(r.ok){ enabledState=want; updateEnabledUI();
+        toast(want ? "已开启伪造，记得关开定位生效" : "已恢复真实定位，记得关开定位生效"); }
+      else toast("切换失败 "+r.status);
+    })
+    .catch(function(){ toast("网络错误"); });
 }
 
 function dispPos(){return datum==="gcj"?GCJ.wgs2gcj(WGS.lat,WGS.lng):[WGS.lat,WGS.lng];}
@@ -285,7 +338,7 @@ function commit(){
   var payload={lat:WGS.lat, lng:WGS.lng,
     altitude:numOrNull("alt"), horizontalAccuracy:numOrNull("hacc"), verticalAccuracy:numOrNull("vacc")};
   fetch("/set?token="+encodeURIComponent(token),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)})
-    .then(function(r){ if(r.ok){ saved=true; info(); toast("已保存 ✓ 记得按刷新步骤生效"); } else { toast("保存失败 "+r.status); } })
+    .then(function(r){ if(r.ok){ saved=true; enabledState=true; updateEnabledUI(); toast("已保存 ✓ 记得关开定位生效"); } else { toast("保存失败 "+r.status); } })
     .catch(function(){ toast("网络错误"); });
 }
 
@@ -319,6 +372,7 @@ function load(){
   fetch("/loc.json?token="+encodeURIComponent(token)).then(function(r){return r.json();}).then(function(d){
     WGS={lat:d.latitude, lng:d.longitude};
     saved=true;
+    enabledState=(d.enabled!==false);
     $("alt").value=(d.altitude!==undefined?d.altitude:"");
     $("hacc").value=(d.horizontalAccuracy!==undefined?d.horizontalAccuracy:39);
     $("vacc").value=(d.verticalAccuracy!==undefined?d.verticalAccuracy:1000);
@@ -339,7 +393,7 @@ function load(){
     L.control.layers({"高德地图":amapVec,"高德卫星":amapSat,"国外 OSM":osm},null,{collapsed:false}).addTo(map);
 
     marker=L.marker(dispPos(),{draggable:true}).addTo(map);
-    info();
+    updateEnabledUI();
 
     map.on("baselayerchange",function(e){datum=e.layer.datum||"wgs"; var p=dispPos(); marker.setLatLng(p); map.setView(p,map.getZoom()); info();});
     map.on("click",function(e){movePin(e.latlng.lat,e.latlng.lng);});
@@ -350,6 +404,7 @@ function load(){
 $("btn").addEventListener("click",search);
 $("q").addEventListener("keydown",function(e){if(e.key==="Enter")search();});
 $("savebtn").addEventListener("click",commit);
+$("restorebtn").addEventListener("click",toggleEnabled);
 load();
 </script>
 </body>
