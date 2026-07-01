@@ -39,33 +39,41 @@ jobs:
           echo "$result" | jq .
 
       - name: Sync extra branches and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           git remote add upstream https://github.com/mekos2772/ios-location-spoofer.git
-          git fetch origin --prune --tags
           git fetch upstream --prune --tags
 
           default_branch="main"
 
-          git for-each-ref --format='%(refname:short)' refs/remotes/upstream | while IFS= read -r remote_branch; do
+          git for-each-ref --format='%(refname:short) %(objectname)' refs/remotes/upstream | while read -r remote_branch upstream_sha; do
             branch="${remote_branch#upstream/}"
 
             if [ "$branch" = "HEAD" ] || [ "$branch" = "$default_branch" ]; then
               continue
             fi
 
-            upstream_ref="refs/remotes/upstream/$branch"
-            origin_ref="refs/remotes/origin/$branch"
+            current_sha="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/$branch" --jq '.object.sha' 2>/dev/null || true
+            )"
 
-            if git show-ref --verify --quiet "$origin_ref"; then
-              if git merge-base --is-ancestor "$origin_ref" "$upstream_ref"; then
-                git push origin "$upstream_ref:refs/heads/$branch"
-              else
-                echo "Skipping divergent branch: $branch"
-              fi
+            if [ -z "$current_sha" ]; then
+              echo "Creating branch: $branch"
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f ref="refs/heads/$branch" \
+                -f sha="$upstream_sha" >/dev/null
+            elif [ "$current_sha" = "$upstream_sha" ]; then
+              echo "Branch already current: $branch"
             else
-              git push origin "$upstream_ref:refs/heads/$branch"
+              echo "Updating branch: $branch"
+              if ! gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/$branch" \
+                -f sha="$upstream_sha" \
+                -F force=false >/dev/null; then
+                echo "Skipping divergent or protected branch: $branch"
+              fi
             fi
           done
 
@@ -79,7 +87,7 @@ jobs:
               continue
             fi
 
-            git push origin "$tag_ref:$tag_ref"
+            git push origin "$tag_ref:$tag_ref" || echo "Skipping tag push: $tag_name"
           done
 
       - name: Sync releases and assets
