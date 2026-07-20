@@ -96,13 +96,14 @@ location-picker/worker/             # Cloudflare Worker 版（免 VPS，支持 L
 
 经常换定位、懒得手动查坐标改参数？项目自带 [`location-picker/`](location-picker/) 地图选点工具：点地图即定位、海拔自动、精度可调，Loon / Shadowrocket 通过 `configUrl` 读取。
 
-**三种部署方式：**
+**四种部署方式：**
 
 | 方式 | 目录 | 适合 |
 |------|------|------|
 | **Cloudflare Worker — Wrangler CLI**（推荐） | [`location-picker/worker/`](location-picker/worker/) | 免 VPS、自带 HTTPS；熟悉命令行 |
 | **Cloudflare Worker — 网页后台** | [`location-picker/cloudflare-webui/`](location-picker/cloudflare-webui/) | 免 VPS、自带 HTTPS；不想装 npm / Wrangler，复制单文件即可 |
 | Node 自托管 | [`location-picker/server.js`](location-picker/server.js) | 有自己的 VPS / NAS |
+| Docker | [`location-picker/Dockerfile`](location-picker/Dockerfile) | 有 Docker 环境 |
 
 Loon 插件 **远程配置 URL** 示例：
 
@@ -141,3 +142,13 @@ node server.js
 数据文件 `loc.json` 自动落在 `server.js` 同目录，记录当前坐标 / 海拔 / 精度；已在 `.gitignore` 中忽略，不会被误提交进仓库。
 
 > ⚠️ **不要把 `TOKEN` 写在命令行历史里**——推荐用 systemd 的 `Environment=` 或 `.env` + `direnv`，避免 `history` / `ps aux` 泄露。
+
+### Docker
+
+```bash
+cd location-picker
+echo "TOKEN=$(openssl rand -hex 24)" > .env
+docker compose up -d
+```
+
+镜像基于 `node:22-alpine`，数据卷挂载到当前目录，设 `restart: unless-stopped`。

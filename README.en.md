@@ -94,13 +94,14 @@ location-picker/worker/             # Cloudflare Worker version (no VPS; support
 
 Change location often and tired of looking up coordinates by hand? The bundled [`location-picker/`](location-picker/) tool lets you tap a map to set your location: altitude is filled in automatically and accuracy is adjustable. Loon / Shadowrocket read it via `configUrl`.
 
-**Three deployment options:**
+**Four deployment options:**
 
 | Option | Directory | Best for |
 |--------|-----------|----------|
 | **Cloudflare Worker — Wrangler CLI** (recommended) | [`location-picker/worker/`](location-picker/worker/) | No VPS, HTTPS included; comfortable with the CLI |
 | **Cloudflare Worker — dashboard** | [`location-picker/cloudflare-webui/`](location-picker/cloudflare-webui/) | No VPS, HTTPS included; no npm/Wrangler — paste a single file |
 | Self-hosted Node | [`location-picker/server.js`](location-picker/server.js) | You have your own VPS / NAS |
+| Docker | [`location-picker/Dockerfile`](location-picker/Dockerfile) | You have Docker |
 
 Loon plugin **remote config URL** example:
 
@@ -139,6 +140,16 @@ node server.js
 The data file `loc.json` is written next to `server.js` and records the current coordinates / altitude / accuracy. It is listed in `.gitignore`, so it won't be committed to the repo by accident.
 
 > ⚠️ **Don't put `TOKEN` in your shell history.** Prefer systemd's `Environment=` or `.env` + `direnv` to avoid leaking it via `history` / `ps aux`.
+
+### Docker
+
+```bash
+cd location-picker
+echo "TOKEN=$(openssl rand -hex 24)" > .env
+docker compose up -d
+```
+
+Based on `node:22-alpine`. Data volume mounts to current directory. `restart: unless-stopped`.
 
 ## Security note
 

@@ -37,7 +37,7 @@ if (!TOKEN) {
 }
 const CERT = process.env.CERT || "";                   // https 证书 fullchain 路径（留空=http）
 const KEY = process.env.KEY || "";                     // https 私钥路径
-const DATA_FILE = path.join(__dirname, "loc.json");
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "loc.json");
 
 // 常量时间比较，避免通过响应时延逐字节爆破 token
 function safeEqual(a, b) {
@@ -311,6 +311,7 @@ var enabledState = true;    // true=伪造中；false=已恢复真实定位（�
 function $(id){return document.getElementById(id);}
 function toast(t){var e=$("toast");e.textContent=t;e.classList.add("show");setTimeout(function(){e.classList.remove("show");},1800);}
 function numOrNull(id){var v=$(id).value.trim();return v===""?null:Number(v);}
+function wrapLng(lng){return ((((Number(lng)+180)%360)+360)%360)-180;}
 
 function info(){
   if(!enabledState){
@@ -343,10 +344,11 @@ function toggleEnabled(){
 }
 
 function dispPos(){return datum==="gcj"?GCJ.wgs2gcj(WGS.lat,WGS.lng):[WGS.lat,WGS.lng];}
-function toWgs(lat,lng){return datum==="gcj"?GCJ.gcj2wgs(lat,lng):[lat,lng];}
+function toWgs(lat,lng){lng=wrapLng(lng);return datum==="gcj"?GCJ.gcj2wgs(lat,lng):[lat,lng];}
 
 // 按地形取海拔（open-meteo 免费高程接口，传 WGS-84）
 function fetchElevation(lat,lng){
+  lng=wrapLng(lng);
   return fetch("https://api.open-meteo.com/v1/elevation?latitude="+lat+"&longitude="+lng)
     .then(function(r){return r.json();})
     .then(function(d){return (d&&d.elevation&&d.elevation.length)?d.elevation[0]:null;})
@@ -355,8 +357,9 @@ function fetchElevation(lat,lng){
 
 // 移动定位点(图钉)：只预览，不保存
 function movePin(dispLat,dispLng){
+  dispLng=wrapLng(dispLng);
   var w=toWgs(dispLat,dispLng);
-  WGS={lat:w[0], lng:w[1]};
+  WGS={lat:w[0], lng:wrapLng(w[1])};
   saved=false;
   marker.setLatLng([dispLat,dispLng]);
   info();
