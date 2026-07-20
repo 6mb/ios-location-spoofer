@@ -3,7 +3,7 @@
 #!homepage=https://github.com/mekos2772/ios-location-spoofer
 
 [rewrite_local]
-^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|bluedot\.is\.autonavi\.com(?:\.gds\.alibabadns\.com)?)\/clls\/wloc(?:\?.*)?$ url script-response-body https://raw.githubusercontent.com/mekos2772/ios-location-spoofer/main/location-spoofer-qx.js
+^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|gsp-ssl\.ls\.apple\.com|bluedot\.is\.autonavi\.com(?:\.gds\.alibabadns\.com)?)\/clls\/wloc(?:\?.*)?$ url script-response-body https://raw.githubusercontent.com/mekos2772/ios-location-spoofer/main/location-spoofer-qx.js
 
 [mitm]
-hostname = gs-loc.apple.com, gs-loc-cn.apple.com, bluedot.is.autonavi.com, bluedot.is.autonavi.com.gds.alibabadns.com
+hostname = gs-loc.apple.com, gs-loc-cn.apple.com, gsp-ssl.ls.apple.com, bluedot.is.autonavi.com, bluedot.is.autonavi.com.gds.alibabadns.com

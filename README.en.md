@@ -45,6 +45,15 @@ This project intercepts Apple's reply on the way back and rewrites every coordin
 4. Reconnect the VPN and toggle Location Services off/on.
 5. Open Maps to verify.
 
+### MITM failed troubleshooting
+
+If the proxy Request List shows `MITM failed`, this usually points to MITM hostname matching or iOS certificate full-trust state, not to the rewrite script having already failed. Please verify:
+
+1. iOS has full trust enabled for the proxy CA under **Settings → General → About → Certificate Trust Settings**.
+2. The failing Host in Request List is present in the module's `[MITM] hostname` list. Every module in this project includes `gs-loc.apple.com`, `gs-loc-cn.apple.com`, `gsp-ssl.ls.apple.com`, `bluedot.is.autonavi.com`, and `bluedot.is.autonavi.com.gds.alibabadns.com`.
+3. If your log shows another `/clls/wloc` Host, please include the exact Host and path in the issue instead of using broad wildcards such as `*.apple.com` / `*.ls.apple.com`, which may MITM unrelated Apple requests.
+4. If it still fails, try disabling QUIC/HTTP3-related options, reconnect the VPN, then toggle Location Services off/on.
+
 ### Loon notes
 
 1. After importing `ios-location-spoofer.lnplugin`, open the plugin config page under **Settings → Plugins**.

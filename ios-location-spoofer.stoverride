@@ -18,7 +18,7 @@ homepage: https://github.com/mekos2772/ios-location-spoofer
 
 http:
   script:
-    - match: ^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|bluedot\.is\.autonavi\.com(?:\.gds\.alibabadns\.com)?)\/clls\/wloc(?:\?.*)?$
+    - match: ^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|gsp-ssl\.ls\.apple\.com|bluedot\.is\.autonavi\.com(?:\.gds\.alibabadns\.com)?)\/clls\/wloc(?:\?.*)?$
       name: ios-location-spoofer
       type: response
       require-body: true
@@ -29,6 +29,7 @@ http:
   mitm:
     - gs-loc.apple.com
     - gs-loc-cn.apple.com
+    - gsp-ssl.ls.apple.com
     - bluedot.is.autonavi.com
     - bluedot.is.autonavi.com.gds.alibabadns.com
 

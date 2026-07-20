@@ -11,11 +11,14 @@ export const PAGE = `<!doctype html>
   .bar{padding:8px;display:flex;gap:6px;box-sizing:border-box}
   .bar input{flex:1;padding:10px;font-size:16px;border:1px solid #ccc;border-radius:8px}
   .bar button{padding:10px 14px;font-size:16px;border:0;border-radius:8px;background:#007aff;color:#fff}
+  .bar button:disabled{opacity:.55}
   .results{margin:0 8px;border:1px solid #e2e2e2;border-radius:8px;max-height:34vh;overflow:auto;display:none}
   .results.show{display:block}
-  .rrow{padding:10px 12px;font-size:14px;border-bottom:1px solid #eee;color:#222}
+  .rrow{padding:10px 12px;font-size:14px;border-bottom:1px solid #eee;color:#222;display:flex;align-items:center;gap:8px}
   .rrow:last-child{border-bottom:0}
   .rrow:active{background:#f0f6ff}
+  .rrow .fname{flex:1;min-width:0}
+  .rrow .fdel{padding:6px 10px;font-size:13px;border:0;border-radius:6px;background:#ff3b30;color:#fff;flex-shrink:0}
   #map{height:52vh}
   #info{padding:8px 10px;font-size:13px;line-height:1.4}
   .opts{padding:6px 10px 12px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}
@@ -23,6 +26,7 @@ export const PAGE = `<!doctype html>
   .opts input{width:88px;padding:8px;font-size:15px;border:1px solid #ccc;border-radius:6px;margin-top:2px}
   #savebtn{padding:11px 20px;font-size:16px;border:0;border-radius:8px;background:#34c759;color:#fff;font-weight:600}
   #restorebtn{padding:11px 16px;font-size:15px;border:0;border-radius:8px;background:#8e8e93;color:#fff}
+  #favadd,#favlistbtn{padding:11px 14px;font-size:15px;border:0;border-radius:8px;background:#5856d6;color:#fff}
   .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);
     background:rgba(0,0,0,.85);color:#fff;padding:10px 16px;border-radius:8px;
     font-size:14px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:9999}
@@ -32,6 +36,7 @@ export const PAGE = `<!doctype html>
 <body>
 <div class="bar">
   <input id="q" placeholder="搜地名，回车列出候选（只预览，不改定位）">
+  <button id="locatebtn" disabled>当前位置</button>
   <button id="btn">搜</button>
 </div>
 <div class="results" id="results"></div>
@@ -43,7 +48,10 @@ export const PAGE = `<!doctype html>
   <label>垂直精度<input id="vacc" type="number" inputmode="numeric"></label>
   <button id="savebtn">保存定位</button>
   <button id="restorebtn">恢复真实定位</button>
+  <button id="favadd">收藏此点</button>
+  <button id="favlistbtn">我的收藏</button>
 </div>
+<div class="results" id="favs"></div>
 <div class="toast" id="toast"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
 <script>
@@ -92,6 +100,108 @@ function toast(t){var e=$("toast");e.textContent=t;e.classList.add("show");setTi
 function numOrNull(id){var v=$(id).value.trim();return v===""?null:Number(v);}
 // Leaflet 在重复世界地图上可能返回 -239 这类经度，需要归一化。
 function wrapLng(lng){return ((((Number(lng)+180)%360)+360)%360)-180;}
+
+function setLocateBusy(busy){
+  var b=$("locatebtn");
+  b.disabled=!!busy;
+  b.textContent=busy?"定位中…":"当前位置";
+}
+
+function geolocationErrorMessage(err){
+  if(err&&err.code===1)return "定位权限被拒绝，请在 Safari 设置中允许定位";
+  if(err&&err.code===2)return "暂时无法获取当前位置";
+  if(err&&err.code===3)return "获取当前位置超时，请到开阔处重试";
+  return "获取当前位置失败";
+}
+
+var FAV_KEY="lp_favs_v1";
+var FAV_MAX=12;
+function loadFavs(){
+  try{
+    var raw=localStorage.getItem(FAV_KEY);
+    var a=raw?JSON.parse(raw):[];
+    return Array.isArray(a)?a:[];
+  }catch(e){return [];}
+}
+function saveFavs(list){
+  try{localStorage.setItem(FAV_KEY,JSON.stringify(list.slice(0,FAV_MAX)));}catch(e){}
+}
+function applyFavorite(it){
+  var lat=Number(it.lat), lng=wrapLng(it.lng);
+  if(!Number.isFinite(lat)||!Number.isFinite(lng)){toast("收藏坐标无效");return;}
+  WGS={lat:lat,lng:lng};
+  saved=false;
+  if(it.alt!=null&&it.alt!=="")$("alt").value=it.alt;
+  if(it.hacc!=null&&it.hacc!=="")$("hacc").value=it.hacc;
+  if(it.vacc!=null&&it.vacc!=="")$("vacc").value=it.vacc;
+  var p=dispPos();
+  marker.setLatLng(p);
+  map.setView(p,15);
+  info();
+  toast("已加载收藏，确认后保存");
+}
+function renderFavs(){
+  var box=$("favs");
+  var list=loadFavs();
+  box.innerHTML="";
+  if(!list.length){box.classList.remove("show");return;}
+  list.forEach(function(it,idx){
+    var row=document.createElement("div");
+    row.className="rrow";
+    var name=document.createElement("span");
+    name.className="fname";
+    name.textContent=it.name||(Number(it.lat).toFixed(4)+","+Number(it.lng).toFixed(4));
+    name.addEventListener("click",function(){
+      $("results").classList.remove("show");
+      applyFavorite(it);
+    });
+    var del=document.createElement("button");
+    del.className="fdel";
+    del.type="button";
+    del.textContent="删";
+    del.addEventListener("click",function(e){
+      e.stopPropagation();
+      var next=loadFavs();
+      next.splice(idx,1);
+      saveFavs(next);
+      if(next.length)renderFavs();else{box.innerHTML="";box.classList.remove("show");}
+      toast("已删除收藏");
+    });
+    row.appendChild(name);
+    row.appendChild(del);
+    box.appendChild(row);
+  });
+  box.classList.add("show");
+}
+function addFavorite(){
+  if(!Number.isFinite(WGS.lat)||!Number.isFinite(WGS.lng)){toast("当前坐标无效");return;}
+  var def=$("q").value.trim()||(WGS.lat.toFixed(4)+","+WGS.lng.toFixed(4));
+  var name=window.prompt("收藏名称",def);
+  if(name===null)return;
+  name=String(name).trim()||def;
+  var list=loadFavs().filter(function(it){
+    return Math.abs(Number(it.lat)-WGS.lat)>1e-5||Math.abs(Number(it.lng)-WGS.lng)>1e-5;
+  });
+  list.unshift({
+    name:name,
+    lat:WGS.lat,
+    lng:WGS.lng,
+    alt:numOrNull("alt"),
+    hacc:numOrNull("hacc"),
+    vacc:numOrNull("vacc"),
+    ts:Date.now()
+  });
+  saveFavs(list);
+  renderFavs();
+  toast("已收藏");
+}
+function toggleFavs(){
+  var box=$("favs");
+  if(box.classList.contains("show")){box.classList.remove("show");return;}
+  $("results").classList.remove("show");
+  if(!loadFavs().length){toast("暂无收藏");return;}
+  renderFavs();
+}
 
 function info(){
   if(!enabledState){
@@ -152,6 +262,48 @@ function commit(){
     .catch(function(){ toast("网络错误"); });
 }
 
+function locateCurrent(){
+  if(enabledState){
+    toast("请先恢复真实定位并刷新定位服务");
+    return;
+  }
+  if(!navigator.geolocation){
+    toast("当前浏览器不支持定位");
+    return;
+  }
+
+  setLocateBusy(true);
+  navigator.geolocation.getCurrentPosition(
+    function(pos){
+      var lat=Number(pos&&pos.coords&&pos.coords.latitude);
+      var lng=wrapLng(pos&&pos.coords&&pos.coords.longitude);
+      if(!Number.isFinite(lat)||!Number.isFinite(lng)){
+        toast("获取当前位置失败");
+        setLocateBusy(false);
+        return;
+      }
+
+      WGS={lat:lat,lng:lng};
+      saved=false;
+      var p=dispPos();
+      marker.setLatLng(p);
+      map.setView(p,16);
+      info();
+      fetchElevation(WGS.lat,WGS.lng).then(function(el){
+        if(el!==null)$("alt").value=Math.round(el);
+        info();
+      });
+      toast("已定位到当前位置，请确认后保存");
+      setLocateBusy(false);
+    },
+    function(err){
+      toast(geolocationErrorMessage(err));
+      setLocateBusy(false);
+    },
+    {enableHighAccuracy:true,maximumAge:0,timeout:12000}
+  );
+}
+
 function search(){
   var q=$("q").value.trim(); if(!q) return;
   fetch("https://nominatim.openstreetmap.org/search?format=json&addressdetails=0&limit=8&q="+encodeURIComponent(q))
@@ -203,6 +355,7 @@ function load(){
 
     marker=L.marker(dispPos(),{draggable:true}).addTo(map);
     updateEnabledUI();
+    setLocateBusy(false);
 
     map.on("baselayerchange",function(e){datum=e.layer.datum||"wgs"; var p=dispPos(); marker.setLatLng(p); map.setView(p,map.getZoom()); info();});
     map.on("click",function(e){movePin(e.latlng.lat,e.latlng.lng);});
@@ -212,8 +365,11 @@ function load(){
 
 $("btn").addEventListener("click",search);
 $("q").addEventListener("keydown",function(e){if(e.key==="Enter")search();});
+$("locatebtn").addEventListener("click",locateCurrent);
 $("savebtn").addEventListener("click",commit);
 $("restorebtn").addEventListener("click",toggleEnabled);
+$("favadd").addEventListener("click",addFavorite);
+$("favlistbtn").addEventListener("click",toggleFavs);
 load();
 </script>
 </body>
