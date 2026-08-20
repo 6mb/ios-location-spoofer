@@ -38,18 +38,12 @@
   // Stable marker that precedes the AppleWLoc protobuf inside a REAL Apple /clls/wloc
   // response. After the marker come 2 bytes (uint16 BE payload length) then the payload.
   var APPLE_WLOC_MARKER = bytesFromArray([0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
-  var ROOT_DROP_FIELDS = { 3: true, 4: true, 33: true };
+  var ROOT_DROP_FIELDS = {};
   var CELL_RESPONSE_FIELDS = { 22: true, 24: true };
-  var LOCATION_REPLACED_FIELDS = {
-    1: true,
-    2: true,
-    3: true,
-    4: true,
-    5: true,
-    6: true,
-    11: true,
-    12: true
-  };
+  // 位置子消息只改写 纬度(1)/经度(2)/精度(3)，其余字段（海拔、垂直精度、
+  // 运动状态、unknown 等）一律原样透传——改写或新增的字段越多，越容易被
+  // iOS 判定为非法响应，导致 “定位不可用”。
+  var LOCATION_REPLACED_FIELDS = { 1: true, 2: true, 3: true };
 
   function bytesFromArray(values) {
     return new Uint8Array(values);
@@ -554,42 +548,47 @@
   }
 
   function patchLocation(locationPayload, config) {
+    // 最小改写：只替换已存在的 纬度(1)/经度(2)/精度(3)，不改动、不新增任何其他字段。
+    // 若该位置子消息连纬度或经度都没有（不是我们要的目标），原样放行，避免塞数据
+    // 把响应写坏导致 iOS “定位不可用”。
     var parts = [];
     var fields = locationPayload.length ? parseFields(locationPayload) : [];
-    for (var i = 0; i < fields.length; i += 1) {
-      if (!LOCATION_REPLACED_FIELDS[fields[i].fieldNumber]) {
-        parts.push(fields[i].raw);
+    var hasLat = false;
+    var hasLon = false;
+    var i;
+    for (i = 0; i < fields.length; i += 1) {
+      if (fields[i].fieldNumber === 1 && fields[i].wireType === 0) hasLat = true;
+      if (fields[i].fieldNumber === 2 && fields[i].wireType === 0) hasLon = true;
+    }
+    if (!hasLat || !hasLon) {
+      return locationPayload;
+    }
+    for (i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.fieldNumber === 1 && field.wireType === 0) {
+        parts.push(makeVarintField(1, coordToInt(config.latitude)));
+      } else if (field.fieldNumber === 2 && field.wireType === 0) {
+        parts.push(makeVarintField(2, coordToInt(config.longitude)));
+      } else if (field.fieldNumber === 3 && field.wireType === 0) {
+        parts.push(makeVarintField(3, config.horizontalAccuracy));
+      } else {
+        parts.push(field.raw);
       }
     }
-
-    parts.push(makeVarintField(1, coordToInt(config.latitude)));
-    parts.push(makeVarintField(2, coordToInt(config.longitude)));
-    parts.push(makeVarintField(3, config.horizontalAccuracy));
-    parts.push(makeVarintField(4, config.unknownValue4));
-    parts.push(makeVarintField(5, config.altitude));
-    parts.push(makeVarintField(6, config.verticalAccuracy));
-    parts.push(makeVarintField(11, config.motionActivityType));
-    parts.push(makeVarintField(12, config.motionActivityConfidence));
     return concatBytes(parts);
   }
 
   function patchWifiDevice(wifiPayload, config) {
     var fields = parseFields(wifiPayload);
     var parts = [];
-    var patchedLocation = false;
 
     for (var i = 0; i < fields.length; i += 1) {
       var field = fields[i];
       if (field.fieldNumber === 2 && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(2, patchLocation(field.valueBytes, config)));
-        patchedLocation = true;
       } else {
         parts.push(field.raw);
       }
-    }
-
-    if (!patchedLocation) {
-      parts.push(makeLengthDelimitedField(2, patchLocation(bytesFromArray([]), config)));
     }
 
     return concatBytes(parts);
@@ -598,20 +597,14 @@
   function patchCellTower(cellPayload, config) {
     var fields = parseFields(cellPayload);
     var parts = [];
-    var patchedLocation = false;
 
     for (var i = 0; i < fields.length; i += 1) {
       var field = fields[i];
       if (field.fieldNumber === 5 && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(5, patchLocation(field.valueBytes, config)));
-        patchedLocation = true;
       } else {
         parts.push(field.raw);
       }
-    }
-
-    if (!patchedLocation) {
-      parts.push(makeLengthDelimitedField(5, patchLocation(bytesFromArray([]), config)));
     }
 
     return concatBytes(parts);
@@ -631,7 +624,8 @@
       } else if (isCellResponseField(field.fieldNumber) && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(field.fieldNumber, patchCellTower(field.valueBytes, config)));
         cellCount += 1;
-      } else if (!ROOT_DROP_FIELDS[field.fieldNumber]) {
+      } else {
+        // 根级其余字段一律原样保留，避免丢弃 iOS 校验所依赖的信息
         parts.push(field.raw);
       }
     }
