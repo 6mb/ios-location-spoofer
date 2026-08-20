@@ -829,12 +829,57 @@
     };
   }
 
-  function spoofAppleResponse(responseBytes, configInput) {
-    var config = normalizeConfig(configInput);
-    var extraction = extractAppleWLocPayload(responseBytes);
-    var patched = patchAppleWLocPayload(extraction.payload, config);
-    var response;
+  // wloc 式原始字节扫描兜底。
+  // 适用场景：iOS 26/27 beta5/beta6 及以后，Apple 若改动 /clls/wloc 响应的封装格式，
+  // 已知格式（ARPC / synthetic / marker / bare）都解析不了，脚本会直接 failOpen 放行 = 定位不生效。
+  // 此时直接在响应缓冲区里逐字节找“可改写的 WLOC protobuf”（wifi 设备 field 2 / 基站 field 22/24），
+  // 找到就把坐标改掉，并用标准 synthetic 封包返回。与 wloc 的 dist 脚本行为一致。
+  function scanPatchAppleWLoc(responseBytes, config) {
+    if (!responseBytes || responseBytes.length < 8) {
+      throw new Error("body too short for raw scan: " + (responseBytes ? responseBytes.length : 0));
+    }
+    var offsets = [];
+    var i;
+    var frameLimit = Math.min(96, Math.max(0, responseBytes.length - 10));
+    for (i = 0; i <= frameLimit; i += 2) {
+      offsets.push(i);
+    }
+    var rawLimit = Math.min(256, Math.max(0, responseBytes.length - 4));
+    for (i = 0; i <= rawLimit; i += 1) {
+      if (offsets.indexOf(i) < 0) {
+        offsets.push(i);
+      }
+    }
+    var errs = [];
+    for (i = 0; i < offsets.length; i += 1) {
+      var offset = offsets[i];
+      try {
+        var slice = responseBytes.slice(offset);
+        if (!looksLikeAppleWLocPayload(slice)) {
+          continue;
+        }
+        var patched = patchAppleWLocPayload(slice, config);
+        if (patched.wifiCount > 0 || patched.cellCount > 0) {
+          return {
+            response: buildAppleWLocResponse(patched.payload),
+            payload: patched.payload,
+            wifiCount: patched.wifiCount,
+            cellCount: patched.cellCount,
+            kind: "raw",
+            offset: offset
+          };
+        }
+      } catch (err) {
+        if (errs.length < 6) {
+          errs.push("@" + offset + ":" + err.message);
+        }
+      }
+    }
+    throw new Error("raw scan found no patchable WLoc payload" + (errs.length ? ("; " + errs.join(" | ")) : ""));
+  }
 
+  function buildPatchedResponse(extraction, patched, config) {
+    var response;
     if (extraction.kind === "arpc") {
       // Write back in ARPC format, preserving the original envelope metadata.
       var arpcOut = {
@@ -860,7 +905,6 @@
       // synthetic / bare – use the simple prefix format.
       response = buildAppleWLocResponse(patched.payload, extraction.prefix);
     }
-
     return {
       response: response,
       payload: patched.payload,
@@ -868,6 +912,37 @@
       cellCount: patched.cellCount,
       kind: extraction.kind,
       prefix: extraction.prefix ? hexPreview(extraction.prefix, 8) : ""
+    };
+  }
+
+  function spoofAppleResponse(responseBytes, configInput) {
+    var config = normalizeConfig(configInput);
+    var extraction = null;
+    var strictError = null;
+    try {
+      extraction = extractAppleWLocPayload(responseBytes);
+    } catch (err) {
+      strictError = err;
+    }
+
+    if (extraction) {
+      var patched = patchAppleWLocPayload(extraction.payload, config);
+      if (patched.wifiCount > 0 || patched.cellCount > 0) {
+        return buildPatchedResponse(extraction, patched, config);
+      }
+      strictError = new Error("no patchable location fields via " + extraction.kind);
+    }
+
+    // 已知封装格式都匹配/改不到 → 原始字节扫描兜底（应对 iOS 26/27 beta5/beta6 响应封装变化）
+    var raw = scanPatchAppleWLoc(responseBytes, config);
+    return {
+      response: raw.response,
+      payload: raw.payload,
+      wifiCount: raw.wifiCount,
+      cellCount: raw.cellCount,
+      kind: raw.kind,
+      offset: raw.offset,
+      strictError: strictError ? strictError.message : null
     };
   }
 

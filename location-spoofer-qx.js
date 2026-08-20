@@ -298,19 +298,84 @@
     return concatBytes([prefix || APPLE_WLOC_PREFIX, writeUInt16BE(payload.length), payload]);
   }
 
-  function spoofAppleResponse(responseBytes, config) {
-    var extraction = extractAppleWLocPayload(responseBytes);
-    var patched = patchAppleWLocPayload(extraction.payload, config);
-    var response;
-    if (extraction.kind === "arpc") {
-      response = serializeArpc({ version: extraction.arpc.version, locale: extraction.arpc.locale, appIdentifier: extraction.arpc.appIdentifier, osVersion: extraction.arpc.osVersion, functionId: extraction.arpc.functionId, payload: patched.payload });
-    } else if (extraction.kind === "marker") {
-      var newLenBytes = writeUInt16BE(patched.payload.length);
-      response = concatBytes([extraction.prefix, extraction.markerAndLen.slice(0, APPLE_WLOC_MARKER.length), newLenBytes, patched.payload, extraction.suffix]);
-    } else {
-      response = buildAppleWLocResponse(patched.payload, extraction.prefix);
+  // wloc 式原始字节扫描兜底。iOS 26/27 beta5/beta6 及以后若 Apple 改动 /clls/wloc 响应的
+  // 封装格式，已知格式解析会失败 → 直接在缓冲区里逐字节找可改写的 WLOC protobuf 并打补丁。
+  function scanPatchAppleWLoc(responseBytes, config) {
+    if (!responseBytes || responseBytes.length < 8) {
+      throw new Error("body too short for raw scan: " + (responseBytes ? responseBytes.length : 0));
     }
-    return { response: response, payload: patched.payload, wifiCount: patched.wifiCount, cellCount: patched.cellCount, kind: extraction.kind };
+    var offsets = [];
+    var i;
+    var frameLimit = Math.min(96, Math.max(0, responseBytes.length - 10));
+    for (i = 0; i <= frameLimit; i += 2) {
+      offsets.push(i);
+    }
+    var rawLimit = Math.min(256, Math.max(0, responseBytes.length - 4));
+    for (i = 0; i <= rawLimit; i += 1) {
+      if (offsets.indexOf(i) < 0) {
+        offsets.push(i);
+      }
+    }
+    var errs = [];
+    for (i = 0; i < offsets.length; i += 1) {
+      var offset = offsets[i];
+      try {
+        var slice = responseBytes.slice(offset);
+        var tag = slice[0];
+        var fieldNumber = tag >> 3;
+        var wireType = tag & 0x7;
+        if (!(fieldNumber > 0 && (wireType === 0 || wireType === 2))) {
+          continue;
+        }
+        var patched = patchAppleWLocPayload(slice, config);
+        if (patched.wifiCount > 0 || patched.cellCount > 0) {
+          return {
+            response: buildAppleWLocResponse(patched.payload),
+            payload: patched.payload,
+            wifiCount: patched.wifiCount,
+            cellCount: patched.cellCount,
+            kind: "raw",
+            offset: offset
+          };
+        }
+      } catch (err) {
+        if (errs.length < 6) {
+          errs.push("@" + offset + ":" + err.message);
+        }
+      }
+    }
+    throw new Error("raw scan found no patchable WLoc payload" + (errs.length ? ("; " + errs.join(" | ")) : ""));
+  }
+
+  function spoofAppleResponse(responseBytes, config) {
+    var extraction = null;
+    var strictError = null;
+    try {
+      extraction = extractAppleWLocPayload(responseBytes);
+    } catch (err) {
+      strictError = err;
+    }
+
+    if (extraction) {
+      var patched = patchAppleWLocPayload(extraction.payload, config);
+      if (patched.wifiCount > 0 || patched.cellCount > 0) {
+        var response;
+        if (extraction.kind === "arpc") {
+          response = serializeArpc({ version: extraction.arpc.version, locale: extraction.arpc.locale, appIdentifier: extraction.arpc.appIdentifier, osVersion: extraction.arpc.osVersion, functionId: extraction.arpc.functionId, payload: patched.payload });
+        } else if (extraction.kind === "marker") {
+          var newLenBytes = writeUInt16BE(patched.payload.length);
+          response = concatBytes([extraction.prefix, extraction.markerAndLen.slice(0, APPLE_WLOC_MARKER.length), newLenBytes, patched.payload, extraction.suffix]);
+        } else {
+          response = buildAppleWLocResponse(patched.payload, extraction.prefix);
+        }
+        return { response: response, payload: patched.payload, wifiCount: patched.wifiCount, cellCount: patched.cellCount, kind: extraction.kind };
+      }
+      strictError = new Error("no patchable location fields via " + extraction.kind);
+    }
+
+    // 已知封装格式都匹配/改不到 → 原始字节扫描兜底
+    var raw = scanPatchAppleWLoc(responseBytes, config);
+    return { response: raw.response, payload: raw.payload, wifiCount: raw.wifiCount, cellCount: raw.cellCount, kind: raw.kind, offset: raw.offset, strictError: strictError ? strictError.message : null };
   }
 
   function patchedPayloadSummary(payload) {
