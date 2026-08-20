@@ -64,25 +64,15 @@ Apple 从 iOS 26 起大幅强化了 `locationd` 的定位**缓存**：系统会�
 
 ### 拦截域名（必须覆盖，否则拦不到请求）
 
-各模块的 `[MITM] hostname` 已包含 Apple 定位/查找服务（`ls.apple.com` GS-PE 池）的完整域名集合，请确保代理的 HTTPS 解密列表里有它们：
+各模块的 `[MITM] hostname` 已包含完整的 5 个域名，请确保代理的 HTTPS 解密列表里有它们：
 
 ```
 gs-loc.apple.com
 gs-loc-cn.apple.com
 gsp-ssl.ls.apple.com
-gspe1-ssl.ls.apple.com
-gspe19-ssl.ls.apple.com
-gspe19-2-ssl.ls.apple.com
-gspe35-ssl.ls.apple.com
-gspe79-ssl.ls.apple.com
-gspe85-ssl.ls.apple.com
-gsp64-ssl.ls.apple.com
-gsp10-ssl.apple.com
 bluedot.is.autonavi.com
 bluedot.is.autonavi.com.gds.alibabadns.com
 ```
-
-> 新系统（如 iOS 27）的定位/查找请求可能落在 `gspe*`、`gsp*` 这些 `ls.apple.com` 主机上，模块已全部覆盖；导入后请确认列表里有 `gspe1-ssl.ls.apple.com`、`gspe35-ssl.ls.apple.com` 等条目，缺的话手动补上（用逗号分隔）。
 
 ---
 
@@ -94,7 +84,7 @@ bluedot.is.autonavi.com.gds.alibabadns.com
 
 1. **证书信任设置里的开关有没有真的打开**（最常见原因）
 2. 模块是否已导入且启用
-3. HTTPS 解密开关是否打开、拦截域名是否齐全（见上方「拦截域名」清单）
+3. HTTPS 解密开关是否打开、5 个拦截域名是否都在
 4. **是否用对生效步骤**——iOS 26/27 要先**重启设备**；iOS 15~18 多关开几次定位
 5. 把模块 `argument=` 里的 `debug=false` 改成 `debug=true`，去代理日志里搜 `Location spoofer`——能看到「patched … wifi/cell」说明拦截和改写都成功了，剩下的就是缓存问题
 
