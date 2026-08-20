@@ -1,0 +1,4 @@
+worker/
+cloudflare-webui/
+.git/
+*.md
