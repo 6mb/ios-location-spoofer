@@ -21,7 +21,7 @@ iPhone 依靠周围的 Wi-Fi 和基站信号，把 BSSID / CellID 列表发给 A
 - **多平台** — 适配 Shadowrocket / Surge / Loon / Quantumult X / Stash 五个代理平台，免编译即导即用
 - **蜂窝基站坐标修改** — 不只改 Wi-Fi 热点坐标，还处理 CellTower（字段 22/24）的坐标替换
 - **多响应封装兼容 + 原始字节扫描兜底** — 自动识别 Apple 回应的封装格式（ARPC / synthetic / marker / bare）；当测试版系统改变封装导致已知格式解析失败时，直接在响应字节里定位并改写坐标，避免「放行原始数据 → 定位不生效」
-- **最小改写** — 只替换坐标（纬度 / 经度 / 精度），海拔、垂直精度、运动状态等字段一律透传 Apple 原值；不新增字段、不丢弃根字段，最大程度避免 iOS 把响应判为非法（否则会直接显示「定位不可用」）
+- **运动状态伪造** — 一并改写 motionActivityType / motionActivityConfidence，降低被系统识破的可能
 - **iOS 12 兼容构建** — `location-spoofer.js` 使用不含 BigInt 的 int64 实现，兼容旧款设备的 JavaScriptCore
 
 ---
@@ -123,11 +123,12 @@ latitude=39.9042&longitude=116.4074
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `latitude` | 37.3349 | 目标纬度（始终改写） |
-| `longitude` | -122.00902 | 目标经度（始终改写） |
+| `latitude` | 37.3349 | 目标纬度 |
+| `longitude` | -122.00902 | 目标经度 |
 | `address` | （空） | 地址搜索（Loon 插件 UI 填写，联网解析为经纬度，优先于手动经纬度） |
-| `horizontalAccuracy` | 39 | 水平精度（米），仅当目标坐标字段里存在精度字段时替换 |
-| 海拔 / 垂直精度 / 运动状态等 | — | 不再由脚本改写，一律沿用 Apple 响应里的原值（最小改写，防止 iOS 校验失败） |
+| `horizontalAccuracy` | 39 | 水平精度（米），越小越像 GPS |
+| `verticalAccuracy` | 1000 | 垂直精度（米） |
+| `altitude` | 530 | 海拔（米），建议按目标地点改成真实海拔 |
 | `failOpen` | true | 出错时放行原始数据（避免定位完全不可用） |
 | `debug` | false | 调试日志 |
 
@@ -218,7 +219,7 @@ docker compose up -d
 
 - **核心逻辑**：拦截 `/clls/wloc` 响应 → 解析封装（ARPC / synthetic / marker / bare）→ 替换 WiFi（字段 2）与基站（字段 22/24）下的 Location 子消息坐标 → 按原封装封回，iOS 才能正确识别
 - **健壮性**：当测试版系统改变响应封装、已知格式解析失败时，脚本自动启用**原始字节扫描兜底**，直接在返回字节中定位坐标子消息并改写，避免放行导致定位不生效
-- **定位精度**：`horizontalAccuracy` 可在参数里设置（默认 39，想更接近 GPS 可调小到 5~15）。海拔、垂直精度等不再由脚本改写，沿用 Apple 响应原值，减小被系统识破 / 校验失败的风险
+- **定位精度**：默认 `horizontalAccuracy=39`，想更接近 GPS 可调小到 5~15；配了真实海拔后 `verticalAccuracy` 可调小到 10~30
 - **仅网络定位**：GPS 信号强时系统可能忽略网络定位结果，Wi-Fi 定位为主的室内场景效果最佳
 
 ## 致谢
