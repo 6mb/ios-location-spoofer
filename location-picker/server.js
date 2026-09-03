@@ -1,11 +1,17 @@
-// 定位选点服务 —— 单文件、零依赖（仅用 Node 内置模块）
+// 定位选点服务 —— 零依赖（只用 Node 内置模块，含 node:sqlite，需 Node >= 24）
 // 支持：高德矢量 / 高德卫星 / 国外 OSM 多地图切换，自动 GCJ-02<->WGS-84 坐标转换
 // 搜索显示多个候选（只移动视野）；点地图/拖图钉移动定位点；点“保存定位”才写入
 // 点地图自动按地形获取海拔；海拔/水平精度/垂直精度可手动微调
 // 可选自带 https（复用 3x-ui 的 acme.sh 证书）
 //
-// 启动示例（http）：
+// 多人共用：每个 token 一份独立坐标，互不干扰。token 存在 SQLite 里，
+// 由管理台（/admin?token=<ADMIN_TOKEN>）随时生成 / 停用 / 删除，改完立即生效。
+//
+// 启动示例（首次，直接给一个用户 token）：
 //   TOKEN=你的密码 PORT=8080 node server.js
+//
+// 启动示例（带管理台，之后在网页里加人）：
+//   TOKEN=你的密码 ADMIN_TOKEN=管理口令 PORT=8080 node server.js
 //
 // 启动示例（https，复用已有证书）：
 //   TOKEN=你的密码 PORT=8443 \
@@ -13,31 +19,89 @@
 //   KEY=/root/cert/你的域名/privkey.pem \
 //   node server.js
 //
-// Shadowrocket 模块 argument 末尾加：
+// Shadowrocket 模块 argument 末尾加（管理台里有一键复制）：
 //   &configUrl=https://你的域名:8443/loc.json?token=你的密码
 //
-// 注意：URL 必须带 ?token=<TOKEN>。缺 token → 服务端返回 401 + "missing token"；
-// token 错 → 返回 403 + "bad token"。网页端点同样适用。
+// 注意：URL 必须带 ?token=<TOKEN>。缺 token → 401 "missing token"；
+// token 错 → 403 "bad token"；token 被停用 → /loc.json 返回 enabled:false（恢复真实定位）。
 
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const db = require("./db");
+const admin = require("./admin");
 
 const PORT = process.env.PORT || 8080;
-// TOKEN 必设：不设直接退出，绝不用弱口令兜底（否则任何人都能读写你的定位）
-const TOKEN = process.env.TOKEN || "";
-if (!TOKEN) {
-  console.error(
-    "启动失败：未设置 TOKEN 环境变量。请用随机字符串启动，例如：\n" +
-    "  TOKEN=$(openssl rand -hex 24) PORT=8080 node server.js"
-  );
-  process.exit(1);
-}
+// TOKEN 环境变量现在只负责「首次引导」：启动时把里面的 token 灌进数据库，
+// 之后的生成 / 停用 / 删除都在管理台做，改完立即生效，不用重新部署。
+// 库里已经有 token 了的话，这个变量留空也没关系。
+const ENV_TOKENS = String(process.env.TOKEN || "")
+  .split(",")
+  .map(function (t) { return t.trim(); })
+  .filter(function (t) { return t !== ""; });
+// 高德 Web 服务 key。填了就用高德搜地点（0.3 秒，国内数据全），不填完全退回 Nominatim。
+// 绝不能硬编码在这里 —— 这是公开仓库，而高德 Web 服务 key 没有域名限制，泄露即被人白嫖配额。
+const AMAP_KEY = String(process.env.AMAP_KEY || "").trim();
 const CERT = process.env.CERT || "";                   // https 证书 fullchain 路径（留空=http）
 const KEY = process.env.KEY || "";                     // https 私钥路径
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "loc.json");
+const DATA_DIR = path.dirname(DATA_FILE);
+const DATA_BASE = path.basename(DATA_FILE).replace(/\.json$/i, "");
+
+// ---- 数据库：初始化 + 从环境变量/老 JSON 文件迁移 ----
+var DB_FILE = "";
+try {
+  DB_FILE = db.init(DATA_DIR);
+  db.migrateFromEnv(ENV_TOKENS, DATA_DIR, DATA_BASE);
+  db.startLogFlusher();
+  // 归档现在是异步分批的，但仍然不能放在 listen() 之前：库里攒了几十万行时它要跑好一会儿，
+  // 顶到 Railway 的 healthcheckTimeout 就会重启 → 重启后又从头跑一遍 → 崩溃循环。
+  // 先让服务起来，30 秒后再清。
+  function runPrune() {
+    db.pruneLogs().catch(function (e) { console.log("清理任务异常：" + e.message); });
+  }
+  var bootPrune = setTimeout(runPrune, 30000);
+  if (bootPrune.unref) bootPrune.unref();
+  var pruneTimer = setInterval(runPrune, 6 * 3600 * 1000);
+  if (pruneTimer.unref) pruneTimer.unref();
+} catch (e) {
+  console.error("启动失败：无法打开数据库 " + DATA_DIR + "/app.db —— " + e.message);
+  process.exit(1);
+}
+
+// 一个 token 都没有，且没配管理口令 = 服务谁也用不了，直接退出而不是空转
+if (!db.cachedTokens().length && !admin.enabled()) {
+  console.error(
+    "启动失败：数据库里没有任何 token，也没设置 ADMIN_TOKEN。\n" +
+    "  首次部署请二选一：\n" +
+    "    TOKEN=$(openssl rand -hex 24) node server.js        # 直接给一个用户 token\n" +
+    "    ADMIN_TOKEN=$(openssl rand -hex 24) node server.js  # 进管理台自己生成"
+  );
+  process.exit(1);
+}
+
+// 管理口令太短等于没有：管理台认证失败不限速也不记录，弱口令就是个敞开的后门
+if (admin.enabled() && admin.ADMIN_TOKEN.length < 16) {
+  console.error(
+    "启动失败：ADMIN_TOKEN 只有 " + admin.ADMIN_TOKEN.length + " 个字符，至少要 16 个。\n" +
+    "  生成一个：openssl rand -hex 24"
+  );
+  process.exit(1);
+}
+
+// 管理口令绝不能和某个用户 token 撞上，否则普通用户就成了管理员
+if (admin.enabled()) {
+  var clash = db.cachedTokens().some(function (t) { return t.token === admin.ADMIN_TOKEN; });
+  if (clash) {
+    console.error("启动失败：ADMIN_TOKEN 与某个用户 token 相同，请换一个。");
+    process.exit(1);
+  }
+  console.log("管理台已启用：/admin?token=<ADMIN_TOKEN>");
+} else {
+  console.log("未设置 ADMIN_TOKEN，/admin 路径不存在（返回 404）。");
+}
 
 // 常量时间比较，避免通过响应时延逐字节爆破 token
 function safeEqual(a, b) {
@@ -49,26 +113,172 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-// 字段名/默认值与 location-spoofer.js 的 DEFAULT_CONFIG 对齐
-const DEFAULT = {
-  enabled: true,          // false = 脚本放行原始响应（恢复真实定位）
-  latitude: 37.3349,
-  longitude: -122.00902,
-  altitude: 530,
-  horizontalAccuracy: 39,
-  verticalAccuracy: 1000
-};
-
-function readLoc() {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  } catch (e) {
-    return Object.assign({}, DEFAULT);
-  }
+// last_seen_at 每请求写一次太浪费，60 秒内只落一次
+var lastTouch = {};
+function touch(tokenId) {
+  const now = Date.now();
+  if (lastTouch[tokenId] && now - lastTouch[tokenId] < 60000) return;
+  lastTouch[tokenId] = now;
+  db.touchToken(tokenId, now);
 }
 
-function writeLoc(obj) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2));
+// ---- 上游转发：给国内直连不通的第三方 API 兜底 ----
+// 浏览器优先直连，失败/超时才回落到这里，所以正常情况下这两个接口很少被调用。
+// Nominatim 使用条款要求带可识别的 User-Agent，并把频率压在 1 请求/秒以内。
+const USER_AGENT =
+  "ios-location-spoofer-picker/1.0 (+https://github.com/mekos2772/ios-location-spoofer)";
+const UPSTREAM_TIMEOUT = 5000;      // Railway 在美国且无代理，5 秒是充分上界
+const UPSTREAM_MAX_BYTES = 512 * 1024;
+var lastGeocodeAt = 0;
+
+// ---- 异步逆地理编码：坐标 -> 人能读懂的地址 ----
+// 不放在 /set 的响应路径上：高德 0.11s、Nominatim 1.5s，凭什么让用户等。
+// 存坐标立即返回，地址在后台补，回写时靠坐标比对丢弃过期结果（见 db.setAddressIfCoordsMatch）。
+function outOfChina(lat, lng) {
+  return (lng < 72.004 || lng > 137.8347) || (lat < 0.8293 || lat > 55.8271);
+}
+
+// WGS-84 -> GCJ-02。库里存的是 WGS-84（iOS 的 CLLocation 用这个），
+// 但高德的接口一律收发 GCJ-02 —— 直接把 WGS 坐标喂给 regeo，解出来是 500 米外的另一条街。
+// 和选点页 GCJ 模块里的 wgs2gcj 是同一套公式，那边是给底图显示用的，这边是给高德接口用的。
+function wgs2gcj(lat, lng) {
+  if (outOfChina(lat, lng)) return [lat, lng];
+  const a = 6378245, ee = 0.00669342162296594323;
+  var x = lng - 105, y = lat - 35;
+  var dLat = -100 + 2 * x + 3 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+  dLat += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3;
+  dLat += (20 * Math.sin(y * Math.PI) + 40 * Math.sin(y / 3 * Math.PI)) * 2 / 3;
+  dLat += (160 * Math.sin(y / 12 * Math.PI) + 320 * Math.sin(y * Math.PI / 30)) * 2 / 3;
+  var dLng = 300 + x + 2 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  dLng += (20 * Math.sin(6 * x * Math.PI) + 20 * Math.sin(2 * x * Math.PI)) * 2 / 3;
+  dLng += (20 * Math.sin(x * Math.PI) + 40 * Math.sin(x / 3 * Math.PI)) * 2 / 3;
+  dLng += (150 * Math.sin(x / 12 * Math.PI) + 300 * Math.sin(x / 30 * Math.PI)) * 2 / 3;
+  const rad = lat / 180 * Math.PI;
+  var m = Math.sin(rad); m = 1 - ee * m * m;
+  const sq = Math.sqrt(m);
+  return [
+    lat + (dLat * 180) / ((a * (1 - ee)) / (m * sq) * Math.PI),
+    lng + (dLng * 180) / (a / sq * Math.cos(rad) * Math.PI)
+  ];
+}
+
+// 高德接口统一入口：坐标转 GCJ-02，参数顺序是「经度,纬度」
+function amapRegeo(lat, lng) {
+  const g = wgs2gcj(lat, lng);
+  return getJson(
+    "https://restapi.amap.com/v3/geocode/regeo?extensions=base&location=" +
+      encodeURIComponent(g[1].toFixed(6) + "," + g[0].toFixed(6)) +
+      "&key=" + encodeURIComponent(AMAP_KEY),
+    {}, 5000
+  );
+}
+
+// 拉一段 JSON，失败一律 resolve(null) —— 补地址是锦上添花，不该让任何人看到报错
+function getJson(targetUrl, headers, timeoutMs) {
+  return new Promise(function (resolve) {
+    var done = false;
+    function finish(v) { if (!done) { done = true; resolve(v); } }
+    const rq = https.get(targetUrl, { headers: headers || {} }, function (up) {
+      if (up.statusCode < 200 || up.statusCode >= 300) { up.resume(); return finish(null); }
+      var body = "";
+      up.setEncoding("utf8");
+      up.on("data", function (c) {
+        body += c;
+        if (body.length > UPSTREAM_MAX_BYTES) { rq.destroy(); finish(null); }
+      });
+      up.on("end", function () { try { finish(JSON.parse(body)); } catch (e) { finish(null); } });
+    });
+    rq.on("error", function () { finish(null); });
+    rq.setTimeout(timeoutMs || 6000, function () { rq.destroy(); finish(null); });
+  });
+}
+
+async function amapAddress(lat, lng) {
+  if (!AMAP_KEY) return "";
+  const d = await amapRegeo(lat, lng);
+  // 高德对国外坐标返回的是 status=1 但 formatted_address 为空字符串，不是报错 —— 得当查不到处理
+  if (!d || d.status !== "1" || !d.regeocode) return "";
+  const fa = d.regeocode.formatted_address;
+  return typeof fa === "string" ? fa.trim() : "";
+}
+
+async function osmAddress(lat, lng) {
+  const d = await getJson(
+    "https://nominatim.openstreetmap.org/reverse?format=json&zoom=18&addressdetails=0" +
+      "&lat=" + lat.toFixed(6) + "&lon=" + lng.toFixed(6),
+    { "User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh" }, 8000
+  );
+  return d && typeof d.display_name === "string" ? d.display_name.trim() : "";
+}
+
+// 每个 token 同时只跑一次逆解，防止连点刷爆上游。
+// 但排队时必须保留「最后一次」的坐标而不是丢弃它 —— 用户连改两个点时，
+// 该被丢的是先发的那次（尤其国外走 Nominatim 要 1.5 秒，很容易后返回），
+// 而不是后发的、也就是他真正想要的那个点。
+var addrWanted = new Map();           // tokenId -> [lat, lng]，最新意图
+var addrRunning = new Set();          // tokenId，正在解的
+
+function resolveAddress(tokenId, lat, lng) {
+  addrWanted.set(tokenId, [lat, lng]);
+  if (addrRunning.has(tokenId)) return;      // 在跑了，它收尾时会读最新的 addrWanted
+  addrRunning.add(tokenId);
+  (async function () {
+    try {
+      for (;;) {
+        const want = addrWanted.get(tokenId);
+        if (!want) break;
+        addrWanted.delete(tokenId);
+        var addr = "";
+        try {
+          if (!outOfChina(want[0], want[1])) addr = await amapAddress(want[0], want[1]);
+          // 境外，或者境内但高德没数据（荒郊野岭）时兜底
+          if (!addr) addr = await osmAddress(want[0], want[1]);
+        } catch (e) { /* 补地址失败不影响任何主流程 */ }
+        // 带坐标做条件：解的过程中用户又改了点，这次结果自动作废
+        if (addr) {
+          try { db.setAddressIfCoordsMatch(tokenId, want[0], want[1], addr); } catch (e) { /* 库出问题时静默 */ }
+        }
+      }
+    } finally {
+      addrRunning.delete(tokenId);
+    }
+  })();
+}
+
+function proxyUpstream(targetUrl, res, headers, timeoutMs) {
+  var settled = false;
+  function fail(code, msg) {
+    if (settled) return;
+    settled = true;
+    send(res, code, "application/json", JSON.stringify({ error: msg }));
+  }
+  var upReq = https.get(targetUrl, { headers: headers || {} }, function (up) {
+    if (up.statusCode < 200 || up.statusCode >= 300) {
+      up.resume();
+      return fail(502, "upstream " + up.statusCode);
+    }
+    var body = "";
+    up.setEncoding("utf8");
+    up.on("data", function (c) {
+      body += c;
+      if (body.length > UPSTREAM_MAX_BYTES) {
+        upReq.destroy();
+        fail(502, "upstream response too large");
+      }
+    });
+    up.on("end", function () {
+      if (settled) return;
+      settled = true;
+      send(res, 200, "application/json", body);
+    });
+  });
+  upReq.setTimeout(timeoutMs || UPSTREAM_TIMEOUT, function () {
+    upReq.destroy();
+    fail(504, "upstream timeout");
+  });
+  upReq.on("error", function (e) {
+    fail(502, "upstream error: " + e.message);
+  });
 }
 
 function send(res, code, type, body) {
@@ -81,31 +291,201 @@ function send(res, code, type, body) {
 }
 
 // 区分「没传 token」和「token 传错」：前者 401 引导补 ?token=，后者 403
-function checkToken(token, res) {
+// 命中返回 token 行（含 id / status），未命中返回 null 并已写好响应
+function resolveToken(token, res) {
   if (token == null || token === "") {
-    send(res, 401, "application/json", '{"error":"missing token","hint":"add ?token=<TOKEN> to the URL (must match the TOKEN env var)"}');
-    return false;
+    send(res, 401, "application/json", '{"error":"missing token","hint":"add ?token=<TOKEN> to the URL"}');
+    return null;
   }
-  if (!safeEqual(token, TOKEN)) {
+  // 逐个比对，全程走常量时间比较，不因命中位置不同而泄露信息
+  var list = db.cachedTokens();
+  var matched = null;
+  for (var i = 0; i < list.length; i += 1) {
+    if (safeEqual(token, list[i].token)) {
+      matched = list[i];
+    }
+  }
+  if (!matched) {
     send(res, 403, "application/json", '{"error":"bad token"}');
+    return null;
+  }
+  res._tokenId = matched.id;
+  touch(matched.id);
+  return matched;
+}
+
+// 停用的 token 还能被识别（日志里看得到是谁），但不能操作选点
+function requireActive(row, res) {
+  if (row.status !== "active") {
+    send(res, 403, "application/json", '{"error":"token disabled","hint":"该 token 已被管理员停用"}');
     return false;
   }
   return true;
+}
+
+// 只记录业务接口；/health 被 Railway 高频探活，记了全是噪音
+const LOGGED_PATHS = {
+  "/": 1, "/loc.json": 1, "/set": 1, "/enable": 1, "/geocode": 1, "/elevation": 1, "/regeo": 1
+};
+
+// X-Forwarded-For 的语义是「每层代理往尾部追加自己看到的对端地址」，所以
+// 最左边那段是客户端自己写进去的，可以随便伪造 —— 取它等于把日志 IP 的控制权交给攻击者：
+// 爆破 token 时每次换个假 IP，看板那条「同 IP 多次 403」的告警就永远不会触发。
+// 正确做法是从右往左数固定跳数。Railway 前面是一层边缘代理，所以默认 1；
+// 裸机直连公网（没有任何代理）请设成 0，只信 socket 地址。
+const TRUST_PROXY_HOPS = (function () {
+  const raw = process.env.TRUST_PROXY_HOPS;
+  if (raw === undefined || raw === "") return 1;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    console.log("TRUST_PROXY_HOPS 不是合法的非负整数，回落到 1");
+    return 1;
+  }
+  return n;
+})();
+
+function clientIp(req) {
+  const direct = String(req.socket.remoteAddress || "").replace(/^::ffff:/, "");
+  if (TRUST_PROXY_HOPS === 0) return direct.slice(0, 45);
+  const xff = req.headers["x-forwarded-for"];
+  if (!xff) return direct.slice(0, 45);
+  const parts = String(xff).split(",")
+    .map(function (t) { return t.trim(); })
+    .filter(function (t) { return t !== ""; });
+  // 代理层数比预期少（比如有人绕过代理直连）时，最左那段仍然可能是伪造的，
+  // 这种情况下宁可用 socket 地址，也不用一个不可信的值
+  if (parts.length < TRUST_PROXY_HOPS) return direct.slice(0, 45);
+  return (parts[parts.length - TRUST_PROXY_HOPS] || direct).slice(0, 45);
 }
 
 function handler(req, res) {
   const url = new URL(req.url, "http://" + (req.headers.host || "localhost"));
   const token = url.searchParams.get("token");
 
+  // 访问日志：路由只管往 res 上挂 _tokenId / _detail，响应结束后统一落库
+  res._tokenId = 0;
+  res._detail = "";
+  if (LOGGED_PATHS[url.pathname]) {
+    res.on("finish", function () {
+      db.logRequest({
+        ts: Date.now(),
+        tokenId: res._tokenId,
+        path: url.pathname,
+        status: res.statusCode,
+        ip: clientIp(req),
+        ua: String(req.headers["user-agent"] || "").slice(0, 160),
+        detail: res._detail || null
+      });
+    });
+  }
+
+  // ---- 管理台（未设置 ADMIN_TOKEN 时整段不存在，直接落到下面的 404） ----
+  if (admin.handle(req, res, url)) return;
+
+  // ---- 健康检查（无需 token，供 Railway / Docker 探活） ----
+  if (url.pathname === "/health" && req.method === "GET") {
+    // 这个接口不需要 token，所以只能回最少的东西。以前它还返回 admin/tokens/rssMB —— 
+    // admin:true 等于直接告诉外面「这里有个后台」，把 /admin 认证失败也回 404 的伪装白做了；
+    // tokens 泄露用户数，rssMB 能被用来侧面观察负载。这些都挪进了 /admin/api/info。
+    return send(res, 200, "application/json", JSON.stringify({ ok: true }));
+  }
+
+  // ---- 地名搜索转发（Nominatim 国内直连不通；浏览器直连失败才会走到这里） ----
+  if (url.pathname === "/geocode" && req.method === "GET") {
+    var gRow = resolveToken(token, res);
+    if (!gRow || !requireActive(gRow, res)) return;
+    var q = String(url.searchParams.get("q") || "").trim();
+    if (!q) {
+      return send(res, 400, "application/json", '{"error":"missing q"}');
+    }
+    res._detail = q.slice(0, 60);
+    // src=amap：走高德 POI 搜索。用 /place/text 而不是 /geocode/geo ——
+    // 后者只认规范门牌地址，搜「星巴克」直接 status=0；前者才是高德 App 搜索框背后的东西。
+    // city 只传不加 citylimit：它是「优先」而非「限定」，所以地图停在杭州时
+    // 搜「星巴克」出杭州的，搜「北京故宫」照样能出北京的（加了 citylimit 就会返回一堆杭州的杂货店）。
+    if (String(url.searchParams.get("src") || "") === "amap" && AMAP_KEY) {
+      var city = String(url.searchParams.get("city") || "").trim().slice(0, 20);
+      return proxyUpstream(
+        "https://restapi.amap.com/v3/place/text?offset=10&page=1&extensions=base" +
+          "&keywords=" + encodeURIComponent(q) +
+          (city ? "&city=" + encodeURIComponent(city) : "") +
+          "&key=" + encodeURIComponent(AMAP_KEY),
+        res,
+        {}
+      );
+    }
+    // 所有人共用服务端一个 IP，不节流容易触发 Nominatim 封禁
+    var nowTs = Date.now();
+    if (nowTs - lastGeocodeAt < 1000) {
+      return send(res, 429, "application/json", '{"error":"rate limited","hint":"Nominatim 限 1 请求/秒，请稍后重试"}');
+    }
+    lastGeocodeAt = nowTs;
+    return proxyUpstream(
+      "https://nominatim.openstreetmap.org/search?format=json&addressdetails=0&limit=8&q=" +
+        encodeURIComponent(q),
+      res,
+      { "User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh" }
+    );
+  }
+
+  // ---- 海拔转发（open-meteo 免费额度 1 万次/天，政策宽松，不做节流） ----
+  // ---- 地图中心所在城市：只给搜索框当 city 参数用，不写库 ----
+  if (url.pathname === "/regeo" && req.method === "GET") {
+    var rRow = resolveToken(token, res);
+    if (!rRow || !requireActive(rRow, res)) return;
+    var rLat = Number(url.searchParams.get("lat"));
+    var rLng = Number(url.searchParams.get("lng"));
+    if (!isFinite(rLat) || !isFinite(rLng) || !AMAP_KEY || outOfChina(rLat, rLng)) {
+      return send(res, 200, "application/json", '{"city":""}');
+    }
+    return amapRegeo(rLat, rLng).then(function (d) {
+      var c = "";
+      if (d && d.status === "1" && d.regeocode && d.regeocode.addressComponent) {
+        const ac = d.regeocode.addressComponent;
+        // 直辖市的 city 是空数组，得回落到 province
+        c = (typeof ac.city === "string" && ac.city) ? ac.city
+          : (typeof ac.province === "string" ? ac.province : "");
+      }
+      send(res, 200, "application/json", JSON.stringify({ city: c }));
+    });
+  }
+
+  if (url.pathname === "/elevation" && req.method === "GET") {
+    var eRow = resolveToken(token, res);
+    if (!eRow || !requireActive(eRow, res)) return;
+    var elat = Number(url.searchParams.get("lat"));
+    var elng = Number(url.searchParams.get("lng"));
+    if (
+      !isFinite(elat) || !isFinite(elng) ||
+      elat < -90 || elat > 90 || elng < -180 || elng > 180
+    ) {
+      return send(res, 400, "application/json", '{"error":"bad coords"}');
+    }
+    return proxyUpstream(
+      "https://api.open-meteo.com/v1/elevation?latitude=" + elat + "&longitude=" + elng,
+      res,
+      { "User-Agent": USER_AGENT }
+    );
+  }
+
   // ---- Shadowrocket 读取坐标（存的就是 WGS-84，Apple 需要的格式） ----
   if (url.pathname === "/loc.json" && req.method === "GET") {
-    if (!checkToken(token, res)) return;
-    return send(res, 200, "application/json", JSON.stringify(readLoc()));
+    var owner = resolveToken(token, res);
+    if (!owner) return;
+    var loc = db.readLocation(owner.id);
+    // 停用不是拒绝，而是「还你真实定位」：脚本收到 enabled:false 会放行原始响应。
+    // 若回 403，脚本反而会回落到模块里写死的坐标（默认是苹果总部），体验上像是坏了。
+    if (owner.status !== "active") {
+      loc = Object.assign({}, loc, { enabled: false });
+      res._detail = "disabled";
+    }
+    return send(res, 200, "application/json", JSON.stringify(loc));
   }
 
   // ---- 网页保存（前端已转好 WGS-84 再发过来；海拔/精度可选） ----
   if (url.pathname === "/set" && req.method === "POST") {
-    if (!checkToken(token, res)) return;
+    var setOwner = resolveToken(token, res);
+    if (!setOwner || !requireActive(setOwner, res)) return;
     let body = "";
     req.on("data", function (c) {
       body += c;
@@ -122,7 +502,7 @@ function handler(req, res) {
         ) {
           return send(res, 400, "application/json", '{"error":"bad coords"}');
         }
-        const cur = readLoc();
+        const cur = db.readLocation(setOwner.id);
         cur.enabled = true; // 保存一个新位置 = 开启伪造
         cur.latitude = la;
         cur.longitude = lo;
@@ -135,8 +515,10 @@ function handler(req, res) {
         setInt("altitude", j.altitude);
         setInt("horizontalAccuracy", j.horizontalAccuracy);
         setInt("verticalAccuracy", j.verticalAccuracy);
-        writeLoc(cur);
-        return send(res, 200, "application/json", JSON.stringify(cur));
+        const saved = db.writeLocation(setOwner.id, cur);
+        resolveAddress(setOwner.id, la, lo);        // 不 await：地址在后台补
+        res._detail = la.toFixed(5) + "," + lo.toFixed(5);
+        return send(res, 200, "application/json", JSON.stringify(saved));
       } catch (e) {
         return send(res, 400, "application/json", '{"error":"bad json"}');
       }
@@ -146,7 +528,8 @@ function handler(req, res) {
 
   // ---- 一键切换：伪造 / 恢复真实定位 ----
   if (url.pathname === "/enable" && req.method === "POST") {
-    if (!checkToken(token, res)) return;
+    var enableOwner = resolveToken(token, res);
+    if (!enableOwner || !requireActive(enableOwner, res)) return;
     let body = "";
     req.on("data", function (c) {
       body += c;
@@ -155,9 +538,10 @@ function handler(req, res) {
     req.on("end", function () {
       try {
         const j = JSON.parse(body);
-        const cur = readLoc();
+        const cur = db.readLocation(enableOwner.id);
         cur.enabled = j.enabled !== false; // false=恢复真实定位（脚本放行）
-        writeLoc(cur);
+        db.writeLocation(enableOwner.id, cur);
+        res._detail = cur.enabled ? "伪造开" : "恢复真实";
         return send(res, 200, "application/json", JSON.stringify(cur));
       } catch (e) {
         return send(res, 400, "application/json", '{"error":"bad json"}');
@@ -168,12 +552,28 @@ function handler(req, res) {
 
   // ---- 地图网页（与 Worker 版一致，必须带正确 token） ----
   if (url.pathname === "/" && req.method === "GET") {
-    if (!checkToken(token, res)) return;
+    var pRow = resolveToken(token, res);
+    if (!pRow || !requireActive(pRow, res)) return;
     return send(res, 200, "text/html; charset=utf-8", PAGE);
   }
 
   return send(res, 404, "text/plain", "not found");
 }
+
+// 退出前把内存里没落盘的日志冲掉，并给在途响应一点时间 ——
+// 直接 exit 会把正在下载的归档拦腰截断，客户端拿到半个 gzip 文件。
+var closing = false;
+var httpServer = null;
+function shutdown() {
+  if (closing) return;             // 连按两次 Ctrl-C 不要重复 close
+  closing = true;
+  function done() { db.close(); process.exit(0); }
+  const t = setTimeout(done, 8000);   // 兜底：赖着不走的连接最多等 8 秒
+  if (t.unref) t.unref();
+  if (httpServer) { httpServer.close(done); } else { done(); }
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 // ---- 启动：有证书走 https，否则 http ----
 function onListenError(err) {
@@ -192,6 +592,7 @@ function start() {
     try {
       const opts = { cert: fs.readFileSync(CERT), key: fs.readFileSync(KEY) };
       const server = https.createServer(opts, handler);
+      httpServer = server;
       server.on("error", onListenError);
       // acme.sh 续期后无需重启：每 12 小时热加载一次证书
       setInterval(function () {
@@ -210,6 +611,7 @@ function start() {
     }
   }
   const server = http.createServer(handler);
+  httpServer = server;
   server.on("error", onListenError);
   server.listen(PORT, function () {
     console.log("location picker (http) listening on :" + PORT);
@@ -235,6 +637,8 @@ const PAGE = `<!doctype html>
   .results.show{display:block}
   .rrow{padding:10px 12px;font-size:14px;border-bottom:1px solid #eee;color:#222;display:flex;align-items:center;gap:8px}
   .rrow:last-child{border-bottom:0}
+  #results .rrow{display:block}
+  #results .rsub{color:#888;font-size:12px;line-height:1.5}
   .rrow:active{background:#f0f6ff}
   .rrow .fname{flex:1;min-width:0}
   .rrow .fdel{padding:6px 10px;font-size:13px;border:0;border-radius:6px;background:#ff3b30;color:#fff;flex-shrink:0}
@@ -275,6 +679,7 @@ const PAGE = `<!doctype html>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 var token = new URLSearchParams(location.search).get("token") || "";
+var AMAP_ON = ${AMAP_KEY ? "true" : "false"};   // 服务端有没有配 AMAP_KEY，决定搜索走高德还是 Nominatim
 
 // ---------- GCJ-02 <-> WGS-84 坐标转换（中国地图偏移修正） ----------
 var GCJ = (function(){
@@ -456,13 +861,49 @@ function toggleEnabled(){
 function dispPos(){return datum==="gcj"?GCJ.wgs2gcj(WGS.lat,WGS.lng):[WGS.lat,WGS.lng];}
 function toWgs(lat,lng){lng=wrapLng(lng);return datum==="gcj"?GCJ.gcj2wgs(lat,lng):[lat,lng];}
 
+// 第三方 API（Nominatim / open-meteo）国内直连不通：先试直连，失败再回落到服务端转发。
+// 直连正常耗时实测 1.4~2.1 秒，所以超时给到 3.5 秒，避免把慢请求误判成不可达。
+// 探测到不通后记一个标记，本次会话后续直接走转发，不用每次干等；
+// 标记 60 秒过期，防止一次偶发抖动把整个会话钉死在转发上。
+var DIRECT_TIMEOUT=3500, DIRECT_STICKY_MS=60000, directBrokenAt=0;
+function directLooksBroken(){
+  return directBrokenAt>0 && (Date.now()-directBrokenAt)<DIRECT_STICKY_MS;
+}
+function upstream(directUrl, proxyPath){
+  function viaProxy(){
+    return fetch(proxyPath).then(function(r){
+      if(!r.ok) throw new Error("proxy "+r.status);
+      return r.json();
+    });
+  }
+  if(directLooksBroken()) return viaProxy();
+  return new Promise(function(resolve,reject){
+    var settled=false;
+    var timer=setTimeout(function(){
+      if(settled)return;
+      settled=true; directBrokenAt=Date.now(); reject(new Error("direct timeout"));
+    },DIRECT_TIMEOUT);
+    fetch(directUrl).then(function(r){
+      if(!r.ok) throw new Error("direct "+r.status);
+      return r.json();
+    }).then(function(d){
+      if(settled)return;
+      settled=true; clearTimeout(timer); directBrokenAt=0; resolve(d);
+    }).catch(function(e){
+      if(settled)return;
+      settled=true; clearTimeout(timer); directBrokenAt=Date.now(); reject(e);
+    });
+  }).catch(viaProxy);
+}
+
 // 按地形取海拔（open-meteo 免费高程接口，传 WGS-84）
 function fetchElevation(lat,lng){
   lng=wrapLng(lng);
-  return fetch("https://api.open-meteo.com/v1/elevation?latitude="+lat+"&longitude="+lng)
-    .then(function(r){return r.json();})
-    .then(function(d){return (d&&d.elevation&&d.elevation.length)?d.elevation[0]:null;})
-    .catch(function(){return null;});
+  return upstream(
+    "https://api.open-meteo.com/v1/elevation?latitude="+lat+"&longitude="+lng,
+    "/elevation?lat="+lat+"&lng="+lng+"&token="+encodeURIComponent(token)
+  ).then(function(d){return (d&&d.elevation&&d.elevation.length)?d.elevation[0]:null;})
+   .catch(function(){return null;});
 }
 
 // 移动定位点(图钉)：只预览，不保存
@@ -528,27 +969,103 @@ function locateCurrent(){
 }
 
 // 搜索：列出多个候选，点选只移动地图视野（不动定位点、不保存）
+//
+// 搜索源跟着底图走 —— 高德底图用高德 POI 搜索（0.3 秒，国内数据全），
+// 切到「国外 OSM」才用 Nominatim（1.5 秒）。不做「高德查不到自动串 Nominatim」，
+// 那样打个错别字就要罚站 6 秒（高德 0.3 + 直连超时 3.5 + 转发 2）。
+// 查不到时给一个按钮让用户一键切过去，点一下就好，不用等。
+var amapCity = "", amapCityAt = [0, 0];
+
+// 地图中心所在城市。作为 city 参数传给高德（不加 citylimit，所以是「优先」不是「限定」）：
+// 停在杭州搜「星巴克」出杭州的，搜「北京故宫」照样出北京的。中心挪远了才重新解一次。
+function ensureCity(){
+  var c=map.getCenter(), w=toWgs(c.lat,c.lng);
+  if(amapCity && Math.abs(w[0]-amapCityAt[0])<0.25 && Math.abs(w[1]-amapCityAt[1])<0.25){
+    return Promise.resolve(amapCity);
+  }
+  return fetch("/regeo?lat="+w[0].toFixed(6)+"&lng="+w[1].toFixed(6)+"&token="+encodeURIComponent(token))
+    .then(function(r){ return r.ok?r.json():null; })
+    .then(function(d){ amapCity=(d&&d.city)||""; amapCityAt=[w[0],w[1]]; return amapCity; })
+    .catch(function(){ return ""; });
+}
+
+function renderResults(list, empty){
+  var box=$("results"); box.innerHTML="";
+  if(!list.length){
+    box.classList.remove("show");
+    if(empty) empty(); else toast("没找到");
+    return;
+  }
+  list.forEach(function(it){
+    var row=document.createElement("div");
+    row.className="rrow";
+    row.innerHTML='<b>'+escHtml(it.name)+'</b>'+(it.sub?'<br><span class="rsub">'+escHtml(it.sub)+'</span>':'');
+    row.addEventListener("click",function(){
+      box.classList.remove("show"); box.innerHTML="";
+      // it.lat/lng 一律是 WGS-84；显示前按当前底图转
+      var p = datum==="gcj"?GCJ.wgs2gcj(it.lat,it.lng):[it.lat,it.lng];
+      map.setView(p,16);              // 只移动视野；要设为定位，请在地图上点一下放图钉
+      toast("已定位视野，在地图上点一下放置图钉");
+    });
+    box.appendChild(row);
+  });
+  box.classList.add("show");
+}
+
+function escHtml(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); }
+
+function searchAmap(q){
+  return ensureCity().then(function(city){
+    return fetch("/geocode?src=amap&q="+encodeURIComponent(q)+
+                 (city?"&city="+encodeURIComponent(city):"")+
+                 "&token="+encodeURIComponent(token))
+      .then(function(r){ if(!r.ok) throw new Error("amap "+r.status); return r.json(); });
+  }).then(function(d){
+    if(!d || d.status!=="1" || !d.pois) return [];
+    return d.pois.map(function(p){
+      // 高德给的是 GCJ-02，「经度,纬度」顺序。存库和发给 iOS 的必须是 WGS-84，
+      // 不转的话定位会偏 500 米左右。
+      var xy=String(p.location||"").split(",");
+      var g=[+xy[1], +xy[0]];
+      if(!isFinite(g[0])||!isFinite(g[1])) return null;
+      var w=GCJ.gcj2wgs(g[0],g[1]);
+      var ad=(typeof p.address==="string"?p.address:"");
+      return {name:p.name||"", sub:((p.cityname||"")+(p.adname||"")+" "+ad).trim(), lat:w[0], lng:w[1]};
+    }).filter(Boolean);
+  });
+}
+
+function searchOsm(q){
+  return upstream(
+    "https://nominatim.openstreetmap.org/search?format=json&addressdetails=0&limit=8&q="+encodeURIComponent(q),
+    "/geocode?q="+encodeURIComponent(q)+"&token="+encodeURIComponent(token)
+  ).then(function(a){
+    if(!a||!a.length) return [];
+    return a.map(function(it){
+      var d=String(it.display_name||"");
+      return {name:d.split(",")[0], sub:d, lat:+it.lat, lng:+it.lon};
+    });
+  });
+}
+
 function search(){
   var q=$("q").value.trim(); if(!q) return;
-  fetch("https://nominatim.openstreetmap.org/search?format=json&addressdetails=0&limit=8&q="+encodeURIComponent(q))
-    .then(function(r){return r.json();})
-    .then(function(a){
-      var box=$("results"); box.innerHTML="";
-      if(!a||!a.length){ box.classList.remove("show"); toast("没找到"); return; }
-      a.forEach(function(it){
-        var row=document.createElement("div");
-        row.className="rrow";
-        row.textContent=it.display_name;
-        row.addEventListener("click",function(){
-          box.classList.remove("show"); box.innerHTML="";
-          var la=+it.lat, lo=+it.lon;
-          var p = datum==="gcj"?GCJ.wgs2gcj(la,lo):[la,lo];
-          map.setView(p,15);            // 只移动视野；要设为定位，请在地图上点一下放图钉
-          toast("已定位视野，在地图上点一下放置图钉");
+  var useAmap = AMAP_ON && datum==="gcj";
+  (useAmap?searchAmap(q):searchOsm(q))
+    .then(function(list){
+      renderResults(list, useAmap?function(){
+        // 不自动串 Nominatim，给个一键切换 —— 省掉 3.5 秒的直连超时
+        var box=$("results");
+        box.innerHTML='<div class="rrow"><b>没找到「'+escHtml(q)+'」</b><br>'+
+          '<span class="rsub">要搜国外地点？点这里换用 OSM 搜索</span></div>';
+        box.firstChild.addEventListener("click",function(){
+          box.innerHTML=""; box.classList.remove("show");
+          toast("正在用 OSM 搜索…");
+          searchOsm(q).then(function(l){ renderResults(l); }).catch(function(){ toast("搜索失败"); });
         });
-        box.appendChild(row);
-      });
-      box.classList.add("show");
+        box.classList.add("show");
+      }:null);
     })
     .catch(function(){toast("搜索失败");});
 }

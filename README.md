@@ -150,9 +150,13 @@ location-spoofer-config.json         # 配置样板
 test-ios12-compat.js                 # iOS 12 兼容回归测试
 使用教程.md                          # 小白保姆级图文教程
 location-picker/                     # 进阶（可选）：网页地图选点
-location-picker/server.js            # Node 自托管版
+location-picker/server.js            # Node 自托管版（入口 + 用户端接口）
+location-picker/db.js                # SQLite 数据层（token / 坐标 / 日志 / 统计）
+location-picker/admin.js             # 管理台接口 /admin/api/*
+location-picker/admin-page.js        # 管理台页面
 location-picker/worker/              # Cloudflare Worker 版（免 VPS）
 location-picker/cloudflare-webui/    # 网页后台版
+location-picker/RAILWAY.md           # Railway 部署指南
 ```
 
 ---
@@ -165,6 +169,7 @@ location-picker/cloudflare-webui/    # 网页后台版
 |---------|------|------|
 | **Cloudflare Worker — Wrangler CLI**（推荐） | [`location-picker/worker/`](location-picker/worker/) | 免 VPS、自带 HTTPS；熟悉命令行 |
 | **Cloudflare Worker — 网页后台** | [`location-picker/cloudflare-webui/`](location-picker/cloudflare-webui/) | 免 VPS、自带 HTTPS；不想装 npm / Wrangler |
+| **Railway** | [`location-picker/RAILWAY.md`](location-picker/RAILWAY.md) | 免 VPS、自带 HTTPS 域名；想跑完整 Node 版而不是 Worker |
 | Node 自托管 | [`location-picker/server.js`](location-picker/server.js) | 有自己的 VPS / NAS |
 | Docker | [`location-picker/Dockerfile`](location-picker/Dockerfile) | 有 Docker 环境 |
 
@@ -176,20 +181,63 @@ https://你的worker.workers.dev/loc.json?token=你的TOKEN
 
 ### location-picker 服务端配置
 
-`location-picker/server.js` 通过环境变量控制，**`TOKEN` 不设进程会直接退出，不会用弱口令兜底**。
+`location-picker/server.js` 通过环境变量控制。**需要 Node ≥ 24**（用到内置的 `node:sqlite`，依然零 npm 依赖）。
+
+token、坐标、访问日志都存在 SQLite 里（`app.db`，与 `DATA_FILE` 同目录）。**`TOKEN` 现在只负责首次引导**：启动时把里面的 token 灌进数据库，之后的生成 / 停用 / 删除都在管理台网页里做，改完立即生效，不用重新部署。
 
 | 变量 | 是否必设 | 默认值 | 说明 |
 |------|---------|--------|------|
-| `TOKEN` | **必设** | 无 | 访问口令，与模块 `argument=` 末尾 `configUrl` 里的 `token=` 必须一致。建议 `openssl rand -hex 24` 生成 |
+| `TOKEN` | 二选一 | 无 | 用户口令，与模块 `argument=` 末尾 `configUrl` 里的 `token=` 必须一致。建议 `openssl rand -hex 24` 生成。**支持逗号分隔多个**（`TOKEN=t1,t2,t3`），每个 token 拥有独立坐标，多人共用时互不干扰。仅在首次启动时写入数据库 |
+| `ADMIN_TOKEN` | 二选一 | 空 | 管理台口令。**不设置则 `/admin` 路径整个不存在（返回 404）**，不会对外暴露后台。必须与任何用户 token 都不同，否则拒绝启动 |
 | `PORT` | 否 | `8080` | 监听端口；1024 以下需 root |
 | `CERT` | 否 | 空 | HTTPS 证书 fullchain 路径；与 `KEY` 同时设置才走 https |
 | `KEY` | 否 | 空 | HTTPS 私钥路径；与 `CERT` 同时设置才走 https |
+| `DATA_FILE` | 否 | 同目录 `loc.json` | 数据目录锚点；数据库落在同目录下的 `app.db`。容器/Railway 挂卷时指向卷内路径（如 `/data/loc.json`） |
+| `TZ_OFFSET_MIN` | 否 | `480` | 日志与看板的分天/分小时时区偏移（分钟），默认 UTC+8 |
+| `LOG_RETENTION_MONTHS` | 否 | `3` | 日志在表内保留最近 N 个**完整月** + 当月。用月而不是天，是为了让归档文件和删除边界对齐 |
+| `LOG_MAX_ROWS` | 否 | `500000` | 日志行数硬上限；超出时把最旧的整天提前归档并删除 |
+| `ARCHIVE_KEEP_MONTHS` | 否 | `24` | 归档文件最多保留几个月，超出自动删最旧的 |
+| `DAILY_RETENTION_DAYS` | 否 | `400` | `daily` 预聚合表保留天数。它很小，留得比明细久，所以清了明细看板曲线也不会断 |
+
+`TOKEN` 与 `ADMIN_TOKEN` 至少要有一个：两个都没有且数据库为空时，服务会拒绝启动而不是空转。
+
+#### 管理台
+
+设置 `ADMIN_TOKEN` 后访问 `https://你的域名/admin?token=<ADMIN_TOKEN>`，四个页签：
+
+- **Token** —— 生成 / 改备注 / 停用 / 删除；每个 token 显示当前坐标、最后活跃时间、今日请求数；两个一键复制按钮直接生成拼好 token 的 **Shadowrocket 模块**和**选点页链接**（域名从请求头动态取，换服务名不用改代码）
+- **看板** —— Token 总数 / 启用 / 停用 / 今日活跃 / 拉取 / 改点 / 错误七个 KPI，外加近 7–30 天趋势、今日 24 小时分布、Token 活跃排行、错误构成四张图。同一 IP 在窗口内 403 超过 10 次会单独标红提示「疑似 token 配置错误」——**模块里 token 抄错或多个空格是最常见的故障，这条能一眼定位**
+- **日志** —— 按 token、日期范围、仅错误筛选，分页查看
+- **归档** —— 存储概况（数据库大小 / 日志行数 / 归档合计 / 进程内存）、按时间范围导出 `.csv.gz`、归档文件下载与删除、手动触发归档、`VACUUM` 收回磁盘
+
+**停用 token 不是拒绝服务**：`/loc.json` 仍返回 200，但 `enabled` 置为 `false`，脚本会放行原始响应，对方**恢复真实定位**；选点页和 `/set` 则返回 403。之所以不直接回 403，是因为脚本拉不到远程配置时会回落到模块 `argument` 里写死的坐标（默认是苹果总部），体验上像是坏了而不是被停用。
+
+选点页的**地名搜索**和**海拔获取**依赖 Nominatim / open-meteo，这两个在中国大陆直连不通。页面会先试直连（超时 3.5 秒），失败则自动回落到服务端转发接口 `GET /geocode` 和 `GET /elevation`（都需要 token），由服务器代为请求——因此国内直连也能正常搜索和取海拔。`/geocode` 按 Nominatim 使用条款限流到 1 请求/秒，超出返回 429。
+
+#### 日志归档
+
+日志超出保留期后不是直接删掉，而是**先归档、再删除，且只删已归档成功的**（归档失败就跳过，下次重试，宁可多占磁盘也不丢数据）：
+
+1. 按自然月导出成 `<数据目录>/archive/logs-YYYY-MM.csv.gz`
+2. 导出成功才 `DELETE` 那个月的行
+3. 行数超 `LOG_MAX_ROWS` 时粒度降到「整天」，追加进当月那个 `.gz`（gzip 多个数据块可以首尾相接，解压出来仍是完整文件）
+
+实测 CSV+gzip 约 **10.6 字节/行**，压缩比约 1:12。15 人规模下每月归档文件通常在 0.5~2 MB。
+
+归档和导出都用 id 游标分批处理，每批之间 `setImmediate` 让出事件循环——所以导出或归档几十万行期间，其他人的 `/loc.json` 依然是毫秒级响应，不会被卡住。归档任务另外做了防重入，定时任务和管理台的「立即归档」不会同时跑。
+
+> SQLite 的 `DELETE` 只把页标记为可复用，**文件大小不会回落**。稳态下删多少写多少，`app.db` 会停在「保留期存量」这个水位，不会无限涨。只有当你主动调小保留期、想真正把磁盘还回去时，才需要在管理台点一次「压缩数据库」（`VACUUM`，会重写整个库）。
+
+服务另有 `GET /health`（**无需 token**）用于探活，返回 `{"ok":true,"persistent":true,"tokens":11,"admin":true,"rssMB":56,"uptimeMin":120}`。
 
 启动示例：
 
 ```bash
-# http（最简，先跑通流程再用 https）
+# 首次：直接给一个用户 token
 TOKEN=$(openssl rand -hex 24) PORT=8080 node server.js
+
+# 带管理台：之后在网页里加人，不用再动环境变量
+TOKEN=$(openssl rand -hex 24) ADMIN_TOKEN=$(openssl rand -hex 24) PORT=8080 node server.js
 
 # https（复用 acme.sh 证书；续期无需重启，进程每 12 小时自动热加载）
 TOKEN=$(openssl rand -hex 24) PORT=8443 \
@@ -198,19 +246,19 @@ KEY=/root/cert/example.com/privkey.pem \
 node server.js
 ```
 
-数据文件 `loc.json` 自动落在 `server.js` 同目录，记录当前坐标 / 海拔 / 精度；已在 `.gitignore` 中忽略，不会被误提交进仓库。
+数据库 `app.db` 落在 `DATA_FILE` 所在目录（默认即 `server.js` 同目录），已在 `.gitignore` 中忽略。**从旧版本升级无需任何操作**：首次启动会自动把 `TOKEN` 里的 token 和已有的 `loc.json` / `loc-<hash>.json` 坐标导入数据库，老用户无感知。
 
-> ⚠️ **不要把 `TOKEN` 写在命令行历史里**——推荐用 systemd 的 `Environment=` 或 `.env` + `direnv`。
+> ⚠️ **不要把 `TOKEN` / `ADMIN_TOKEN` 写在命令行历史里**——推荐用 systemd 的 `Environment=` 或 `.env` + `direnv`。
 
 #### Docker
 
 ```bash
 cd location-picker
-echo "TOKEN=$(openssl rand -hex 24)" > .env
+{ echo "TOKEN=$(openssl rand -hex 24)"; echo "ADMIN_TOKEN=$(openssl rand -hex 24)"; } > .env
 docker compose up -d
 ```
 
-镜像基于 `node:22-alpine`，数据卷挂载到当前目录，设 `restart: unless-stopped`。
+镜像基于 `node:24-alpine`，数据卷挂载到当前目录，设 `restart: unless-stopped`。
 
 ---
 

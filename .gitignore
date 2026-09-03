@@ -1,0 +1,3 @@
+# JetBrains IDE 本机配置，不入库（否则切分支时 vcs.xml 被删，IDE 会丢失 Git 映射）
+.idea/
+.DS_Store

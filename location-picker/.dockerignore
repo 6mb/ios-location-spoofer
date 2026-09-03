@@ -2,3 +2,15 @@ worker/
 cloudflare-webui/
 .git/
 *.md
+.env
+.env.example
+railway.json
+loc.json
+app.db
+app.db-wal
+app.db-shm
+
+# 归档 CSV 里有 IP、User-Agent、用户搜过的地名，绝不能进仓库/镜像
+archive/
+# 多 token 时代的坐标文件，migrateFromEnv 导入后不会自动删
+loc-*.json

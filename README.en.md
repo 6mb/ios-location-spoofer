@@ -96,7 +96,11 @@ location-spoofer-qx.js              # Quantumult X-specific
 location-spoofer-config.json        # Config sample
 使用教程.md                         # Step-by-step tutorial (Chinese)
 location-picker/                    # Optional: web map picker (Node or Cloudflare Worker)
+location-picker/db.js               # SQLite layer (tokens / coords / logs / stats)
+location-picker/admin.js            # Admin console API
+location-picker/admin-page.js       # Admin console page
 location-picker/worker/             # Cloudflare Worker version (no VPS; supports Loon configUrl)
+location-picker/RAILWAY.md          # Railway deployment guide
 ```
 
 ## Optional: web map location picker
@@ -109,6 +113,7 @@ Change location often and tired of looking up coordinates by hand? The bundled [
 |--------|-----------|----------|
 | **Cloudflare Worker — Wrangler CLI** (recommended) | [`location-picker/worker/`](location-picker/worker/) | No VPS, HTTPS included; comfortable with the CLI |
 | **Cloudflare Worker — dashboard** | [`location-picker/cloudflare-webui/`](location-picker/cloudflare-webui/) | No VPS, HTTPS included; no npm/Wrangler — paste a single file |
+| **Railway** | [`location-picker/RAILWAY.md`](location-picker/RAILWAY.md) | No VPS, HTTPS domain included; runs the full Node version instead of a Worker |
 | Self-hosted Node | [`location-picker/server.js`](location-picker/server.js) | You have your own VPS / NAS |
 | Docker | [`location-picker/Dockerfile`](location-picker/Dockerfile) | You have Docker |
 
@@ -124,20 +129,63 @@ This project welcomes review and feedback from the LINUX DO community: [LINUX DO
 
 ## location-picker server configuration
 
-`location-picker/server.js` is controlled by environment variables. **If `TOKEN` is not set, the process exits immediately — it will never fall back to a weak default.**
+`location-picker/server.js` is controlled by environment variables. **Node >= 24 is required** (it uses the built-in `node:sqlite`; still zero npm dependencies).
+
+Tokens, coordinates, and access logs all live in SQLite (`app.db`, next to `DATA_FILE`). **`TOKEN` is now only a bootstrap**: at startup its values are seeded into the database, after which you create / disable / delete tokens from the admin page — effective immediately, no redeploy.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `TOKEN` | **Yes** | none | Access token. Must match the `token=` in the `configUrl` at the end of the proxy module's `argument=`. Generate one with `openssl rand -hex 24`. |
+| `TOKEN` | one of two | none | User access token; must match the `token=` in the `configUrl` at the end of the proxy module's `argument=`. Generate with `openssl rand -hex 24`. **Accepts a comma-separated list** (`TOKEN=t1,t2,t3`); each token gets its own independent coordinates. Only seeded into the DB on first start. |
+| `ADMIN_TOKEN` | one of two | empty | Admin console password. **Without it the whole `/admin` path does not exist (404)**, so the console is never advertised. Must differ from every user token or the process refuses to start. |
 | `PORT` | No | `8080` | Listen port; ports below 1024 require root. |
 | `CERT` | No | empty | HTTPS fullchain certificate path; HTTPS is used only when both `CERT` and `KEY` are set. |
 | `KEY` | No | empty | HTTPS private key path; used only when both `CERT` and `KEY` are set. |
+| `DATA_FILE` | No | `loc.json` next to `server.js` | Anchors the data directory; the database is created as `app.db` in the same folder. Point it inside a mounted volume (e.g. `/data/loc.json`) on Docker / Railway. |
+| `TZ_OFFSET_MIN` | No | `480` | Timezone offset (minutes) used to bucket logs and dashboard stats by day/hour. Defaults to UTC+8. |
+| `LOG_RETENTION_MONTHS` | No | `3` | Keep the last N **whole months** plus the current one in the table. Months rather than days, so archive files and the delete boundary line up exactly. |
+| `LOG_MAX_ROWS` | No | `500000` | Hard cap on log rows; beyond it the oldest whole days are archived and deleted early. |
+| `ARCHIVE_KEEP_MONTHS` | No | `24` | How many monthly archive files to keep; the oldest are removed beyond this. |
+| `DAILY_RETENTION_DAYS` | No | `400` | Retention for the `daily` rollup table. It is tiny and kept longer than the raw detail, so pruning detail never breaks the dashboard's trend lines. |
+
+At least one of `TOKEN` / `ADMIN_TOKEN` must be set: with neither, and an empty database, the process exits instead of idling uselessly.
+
+### Admin console
+
+With `ADMIN_TOKEN` set, open `https://your-domain/admin?token=<ADMIN_TOKEN>`. Three tabs:
+
+- **Tokens** — create / rename / disable / delete; each row shows current coordinates, last-seen time, and today's request counts. Two one-tap copy buttons emit a ready-to-paste **Shadowrocket module** and **picker URL** with the token already spliced in (the domain is taken from the request headers, so renaming the service needs no code change).
+- **Dashboard** — seven KPIs (total / active / disabled tokens, today's active users, fetches, location changes, errors) plus four charts: 7–30 day trend, today's 24-hour distribution, token activity ranking, and error breakdown. Any single IP with more than 10 `403`s in the window is flagged in red as a likely misconfigured token — **a mistyped token or a stray space in the module is by far the most common failure, and this pinpoints it instantly**.
+- **Logs** — filter by token, date range, or errors only; paginated.
+- **Archive** — storage overview (database size / log rows / archive total / process memory), range export as `.csv.gz`, archive download and delete, manual archive run, and `VACUUM` to reclaim disk.
+
+**Disabling a token is not a denial of service**: `/loc.json` still returns 200 but with `enabled` set to `false`, so the script passes the original response through and the user gets their **real location back**; the picker page and `/set` return 403. A plain 403 would be worse — when the script cannot fetch the remote config it falls back to the coordinates hardcoded in the module `argument` (Apple Park by default), which looks broken rather than disabled.
+
+The picker page's **place search** and **elevation lookup** rely on Nominatim / open-meteo, neither of which is reachable directly from mainland China. The page tries a direct request first (3.5s timeout) and automatically falls back to the server-side proxy endpoints `GET /geocode` and `GET /elevation` (both token-gated). `/geocode` is throttled to 1 request/second per Nominatim's usage policy and returns 429 beyond that.
+
+### Log archiving
+
+Logs past the retention window are not simply dropped — they are **archived first, deleted second, and only ever deleted once archiving succeeded** (a failed archive is skipped and retried later; wasting disk beats losing data):
+
+1. Each whole month is exported to `<data dir>/archive/logs-YYYY-MM.csv.gz`
+2. Only after that export succeeds are that month's rows deleted
+3. When `LOG_MAX_ROWS` is exceeded, the granularity drops to whole days, appended to that month's `.gz` (gzip members concatenate, so the file still decompresses as one)
+
+Measured at roughly **10.6 bytes per row** as gzipped CSV — about 12:1 compression. At a 15-user scale a monthly archive is typically 0.5–2 MB.
+
+Both archiving and export walk the table with an id cursor in batches and yield to the event loop between them, so exporting hundreds of thousands of rows still leaves everyone else's `/loc.json` answering in milliseconds.
+
+> SQLite's `DELETE` only marks pages reusable — **the file never shrinks**. In steady state you delete as much as you write, so `app.db` plateaus at the retention-window size instead of growing forever. Only if you deliberately shorten the retention window and want the disk back do you need the admin console's "compact database" button (`VACUUM`, which rewrites the whole file).
+
+The server also exposes `GET /health` (**no token required**) for liveness probes, returning `{"ok":true,"persistent":true,"tokens":11,"admin":true,"rssMB":56,"uptimeMin":120}`.
 
 Startup examples:
 
 ```bash
-# http (simplest — get the flow working before switching to https)
+# first run: hand out a single user token
 TOKEN=$(openssl rand -hex 24) PORT=8080 node server.js
+
+# with the admin console: add people from the web UI afterwards
+TOKEN=$(openssl rand -hex 24) ADMIN_TOKEN=$(openssl rand -hex 24) PORT=8080 node server.js
 
 # https (reuse acme.sh certs; no restart needed on renewal — the process hot-reloads every 12 hours)
 TOKEN=$(openssl rand -hex 24) PORT=8443 \
@@ -146,19 +194,19 @@ KEY=/root/cert/example.com/privkey.pem \
 node server.js
 ```
 
-The data file `loc.json` is written next to `server.js` and records the current coordinates / altitude / accuracy. It is listed in `.gitignore`, so it won't be committed to the repo by accident.
+`app.db` is written next to `DATA_FILE` and is listed in `.gitignore`. **Upgrading from an older version needs no action**: the first start imports the tokens from `TOKEN` and any existing `loc.json` / `loc-<hash>.json` coordinates into the database.
 
-> ⚠️ **Don't put `TOKEN` in your shell history.** Prefer systemd's `Environment=` or `.env` + `direnv` to avoid leaking it via `history` / `ps aux`.
+> ⚠️ **Don't put `TOKEN` / `ADMIN_TOKEN` in your shell history.** Prefer systemd's `Environment=` or `.env` + `direnv` to avoid leaking it via `history` / `ps aux`.
 
 ### Docker
 
 ```bash
 cd location-picker
-echo "TOKEN=$(openssl rand -hex 24)" > .env
+{ echo "TOKEN=$(openssl rand -hex 24)"; echo "ADMIN_TOKEN=$(openssl rand -hex 24)"; } > .env
 docker compose up -d
 ```
 
-Based on `node:22-alpine`. Data volume mounts to current directory. `restart: unless-stopped`.
+Based on `node:24-alpine`. Data volume mounts to current directory. `restart: unless-stopped`.
 
 ## Security note
 
