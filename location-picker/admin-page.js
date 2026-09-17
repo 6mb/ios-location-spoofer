@@ -229,8 +229,10 @@ function renderTokens(list){
         ' · 今日 拉取 ' + t.todayLoc + ' / 改点 ' + t.todaySet +
         (t.todayErr ? ' / <span class="st-bad">错误 ' + t.todayErr + '</span>' : '') + '</div>' +
       '<div class="row" style="margin-top:10px">' +
-        '<button class="act" data-a="mod">复制模块</button>' +
-        '<button class="act p" data-a="url">复制链接</button>' +
+        '<button class="act p" data-a="sr">复制小火箭链接</button>' +
+        '<button class="act p" data-a="qx">复制圈 X 链接</button>' +
+        '<button class="act" data-a="mod">复制小火箭文本</button>' +
+        '<button class="act p" data-a="url">复制选点链接</button>' +
         '<button class="act s" data-a="label">改备注</button>' +
         '<button class="act s" data-a="toggle">' + (live ? "停用" : "启用") + '</button>' +
         '<button class="act r" data-a="del">删除</button>' +
@@ -249,7 +251,9 @@ $("tokenlist").addEventListener("click", function(ev){
   var t = tokensCache.filter(function(x){ return x.id === id; })[0];
   if(!t) return;
   var a = btn.dataset.a;
-  if(a === "mod") return copy(t.moduleText, "模块已复制，去小火箭粘贴");
+  if(a === "sr") return copy(t.shadowrocketUrl, "已复制，在小火箭：配置 → 模块 → ＋ 中粘贴");
+  if(a === "qx") return copy(t.quantumultXUrl, "已复制，在圈 X 的重写资源中添加；需开启重写和 MitM");
+  if(a === "mod") return copy(t.moduleText, "模块文本已复制，可保存为 .sgmodule 文件");
   if(a === "url") return copy(t.pickerUrl, "选点链接已复制");
   if(a === "label"){
     var v = prompt("备注名", t.label || "");
@@ -274,7 +278,7 @@ $("newbtn").addEventListener("click", function(){
   var label = $("newlabel").value.trim();
   api("/admin/api/tokens", {method:"POST", body:{label:label}}).then(function(t){
     $("newlabel").value = "";
-    return loadTokens().then(function(){ copy(t.moduleText, "已生成并复制模块，直接发给对方"); });
+    return loadTokens().then(function(){ toast("用户已生成，请按客户端选择复制小火箭或圈 X 链接"); });
   }).catch(function(e){ toast("生成失败：" + e.message); });
 });
 

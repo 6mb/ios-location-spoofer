@@ -7,6 +7,8 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const zlib = require("zlib");
+const path = require("path");
+const qxTemplate = fs.readFileSync(path.join(__dirname, "./quantumult-x-template.js"), "utf8");
 const db = require("./db");
 const page = require("./admin-page");
 
@@ -82,6 +84,26 @@ function buildModule(origin, token) {
     "hostname = %APPEND% " + MITM_HOSTS,
     ""
   ].join("\n");
+}
+
+function buildModuleUrl(origin, token, filename) {
+  return origin + "/modules/" + filename + "?token=" + encodeURIComponent(token);
+}
+
+function buildQXModule(origin, token) {
+  return [
+    "#!name=iOS Location Spoofer",
+    "#!desc=Quantumult X 定位重写；读取专属选点网页保存的位置。",
+    "", "[rewrite_local]",
+    PATTERN + " url script-response-body " + buildModuleUrl(origin, token, "quantumult-x.js"),
+    "", "[mitm]", "hostname = " + MITM_HOSTS, ""
+  ].join("\n");
+}
+
+function buildQXScript(origin, token) {
+  return qxTemplate.replace('"__LOCATION_CONFIG_URL__"', function () {
+    return JSON.stringify(origin + "/loc.json?token=" + encodeURIComponent(token));
+  });
 }
 
 function buildPickerUrl(origin, token) {
@@ -196,7 +218,9 @@ function handle(req, res, url) {
         todaySet: h.set_hits || 0,
         todayErr: h.errors || 0,
         moduleText: buildModule(origin, t.token),
-        pickerUrl: buildPickerUrl(origin, t.token)
+        pickerUrl: buildPickerUrl(origin, t.token),
+        shadowrocketUrl: buildModuleUrl(origin, t.token, "shadowrocket.sgmodule"),
+        quantumultXUrl: buildModuleUrl(origin, t.token, "quantumult-x.snippet")
       };
     });
     return json(res, 200, { origin: origin, tokens: rows }), true;
@@ -211,7 +235,9 @@ function handle(req, res, url) {
       json(res, 200, {
         id: t.id, token: t.token, label: t.label, status: t.status,
         moduleText: buildModule(origin, t.token),
-        pickerUrl: buildPickerUrl(origin, t.token)
+        pickerUrl: buildPickerUrl(origin, t.token),
+        shadowrocketUrl: buildModuleUrl(origin, t.token, "shadowrocket.sgmodule"),
+        quantumultXUrl: buildModuleUrl(origin, t.token, "quantumult-x.snippet")
       });
     }).catch(function () { json(res, 400, { error: "bad request" }); });
     return true;
@@ -322,5 +348,8 @@ module.exports = {
   enabled: enabled,
   handle: handle,
   buildModule: buildModule,
+  buildQXModule: buildQXModule,
+  buildQXScript: buildQXScript,
+  originOf: originOf,
   ADMIN_TOKEN: ADMIN_TOKEN
 };
