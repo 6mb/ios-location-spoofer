@@ -390,6 +390,22 @@ function handler(req, res) {
     return send(res, 200, "application/json", JSON.stringify({ ok: true }));
   }
 
+  // 每个用户动态生成专属导入资源，沿用坐标接口的 Token 校验。
+  const moduleBuilders = {
+    "/modules/shadowrocket.sgmodule": admin.buildModule,
+    "/modules/quantumult-x.snippet": admin.buildQXModule,
+    "/modules/quantumult-x.js": admin.buildQXScript
+  };
+  if (Object.prototype.hasOwnProperty.call(moduleBuilders, url.pathname) && req.method === "GET") {
+    var moduleOwner = resolveToken(token, res);
+    if (!moduleOwner || !requireActive(moduleOwner, res)) return;
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    return send(res, 200, url.pathname.endsWith(".js")
+      ? "application/javascript; charset=utf-8" : "text/plain; charset=utf-8",
+      moduleBuilders[url.pathname](admin.originOf(req), moduleOwner.token));
+  }
+
   // ---- 地名搜索转发（Nominatim 国内直连不通；浏览器直连失败才会走到这里） ----
   if (url.pathname === "/geocode" && req.method === "GET") {
     var gRow = resolveToken(token, res);
